@@ -2,7 +2,6 @@
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
-
 [project]
 name = "SearchTermRating"
 version = "0.1.0"
@@ -13,29 +12,38 @@ requires-python = ">=3.9"
 license = { text = "MIT" }
 keywords = ["search", "rating", "cli"]
 classifiers = [
-"Programming Language :: Python :: 3",
-"License :: OSI Approved :: MIT License",
-"Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
 ]
 
-
-# Console script for `SearchTermRating` on PATH
 [project.scripts]
 SearchTermRating = "SearchTermRating.cli:main"
-
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
-
 [tool.setuptools.packages.find]
 where = ["src"]
 
-
 [project.optional-dependencies]
-# Editable dev extras (add tools you like)
+# Developer tools (optional)
 dev = [
-"pytest>=7",
-"ruff>=0.5", # linter/formatter
-"mypy>=1.10"
+  "pytest>=7",
+  "ruff>=0.5",
+  "mypy>=1.10"
+]
+
+# GUI/runtime deps for the Tk app
+gui = [
+  "pillow>=10",
+  "ddgs>=2.2.2",
+  "requests>=2.31",
+  "imagehash>=4.3.1"
+]
+
+# Optional heavy extras for gender/face checks (not required to run)
+faces = [
+  "opencv-python>=4.8",
+  "deepface>=0.0.79"
 ]
