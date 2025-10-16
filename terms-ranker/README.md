@@ -23,3 +23,22 @@ terms-ranker
 ```
 
 Put a `terms.csv` (one term per line, or `term,rating`) anywhere and open it from the app.
+
+Drop-in replacement modules for your project (v0.2.0).
+
+HOW TO APPLY (Windows PowerShell recommended):
+  1) Extract termsranker_port_v1.zip
+  2) Copy the folder 'src/termsranker/' over your project's src/termsranker/
+     (replace existing files `__init__.py`, `core.py`, `persistence.py`, `images.py`, `app.py`).
+  3) Activate your venv and reinstall (editable) if needed:
+        .\.venv\Scripts\Activate.ps1
+        pip install -e .
+  4) Run:
+        terms-ranker
+     or: python -m termsranker.app
+
+Notes:
+  - Optional deps (DeepFace, OpenCV, imagehash) are still optional. Install extras as needed:
+        pip install -e .[vision]
+        pip install -e .[deepface]
+  - Settings dialog lets you toggle filters and weightings at runtime.
