@@ -26,3 +26,4 @@ EOF
 git add .gitignore
 git commit -m "chore: add .gitignore (venv, build, IDE)"
 git push
+src/SearchTermRating.egg-info/
