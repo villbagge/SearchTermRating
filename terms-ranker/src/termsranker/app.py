@@ -20,9 +20,17 @@ PADDING = 12
 THUMB_SIZE = (520, 520)
 SELF_TEST_EACH_BATCH = False  # keep off by default
 
+def canvas_show_message(canvas: "tk.Canvas", msg: str, tag: str = "status", color: str = "#ddd"):
+    try:
+        canvas.delete(tag)
+        w = max(1, int(canvas.winfo_width())); h = max(1, int(canvas.winfo_height()))
+        canvas.create_text(10, 10, text=msg, anchor="nw", fill=color, tags=tag)
+    except Exception:
+        pass
+
 def canvas_show_error(canvas: "tk.Canvas", msg: str):
     try:
-        canvas.delete("img"); canvas.delete("err")
+        canvas.delete("img"); canvas.delete("err"); canvas.delete("status")
         w = max(1, int(canvas.winfo_width())); h = max(1, int(canvas.winfo_height()))
         canvas.create_text(w//2, h//2, text=msg, fill="#ddd", tags="err")
     except Exception:
@@ -41,7 +49,7 @@ def render_to_canvas(canvas: "tk.Canvas", pil_img: Image.Image):
         resample = Image.ANTIALIAS  # type: ignore
     fitted = ImageOps.contain(pil_img.convert("RGB"), (w, h), method=resample)
     tkimg = ImageTk.PhotoImage(fitted)
-    canvas.delete("img")
+    canvas.delete("img"); canvas.delete("status")
     canvas.create_image(w//2, h//2, image=tkimg, anchor="center", tags="img")
     canvas.image = tkimg
 
@@ -73,7 +81,7 @@ class App:
 
         # UI state
         self.extra_var = tk.StringVar(value="")
-        self.status = tk.StringVar(value="Loading…")
+        self.status = tk.StringVar(value="")  # keep but don't spam with hints
         self.frames: list[ttk.Frame] = []
         self.labels: list[tk.Canvas] = []
         self.current_pils: list[Image.Image | None] = []
@@ -115,13 +123,15 @@ class App:
 
             cvs = tk.Canvas(slot, highlightthickness=0, bg="#222")
             cvs.grid(row=0, column=0, sticky="nsew")
-            cvs.create_text(10, 10, text="Loading…", anchor="nw", fill="#ddd", tags="status")
+            # No "Loading..."—will show term name per round
             cvs.bind("<Configure>", lambda e, idx=i: self._on_canvas_resize(idx))
 
             row2 = ttk.Frame(slot); row2.grid(row=1, column=0, sticky="ew", pady=(6, 0))
             row2.columnconfigure(0, weight=1)
 
-            cap = ttk.Label(row2, text="", anchor="w"); cap.grid(row=0, column=0, sticky="w")
+            # Remove captions entirely: keep a placeholder but don't display text
+            cap = ttk.Label(row2, text="", anchor="w")
+            cap.grid(row=0, column=0, sticky="w")
             other_btn = ttk.Button(row2, text="OTHER", width=8, command=lambda idx=i: self._on_other(idx))
             other_btn.grid(row=0, column=1, sticky="e", padx=(6, 0))
 
@@ -211,8 +221,8 @@ class App:
         self.used = load_used(self.used_path); self.seen_hashes = load_seen_hashes(self.seen_hashes_path)
         self.current_four = []; self.current_urls = [None]*4; self.current_raw_bytes = [None]*4; self.current_photos = [None]*4
         self.recency_map.clear(); self.round_id = 0
-        for lbl in self.labels: lbl.delete("all"); lbl.create_text(10,10,text="Loading…", anchor="nw", fill="#ddd", tags="status")
-        for cap in self.captions: cap.configure(text="")
+        for lbl in self.labels:
+            lbl.delete("all")
         with self.prefetch_lock: self.prefetch_queue.clear()
         self._start_initial_prefetch()
         self.status.set(f"Loaded {len(self.terms)} terms from {os.path.basename(path)}")
@@ -333,6 +343,9 @@ class App:
         if len(self.terms) < 4: return PrefetchBatch([], [], [])
         # sample 4 with recency cooldown
         four = weighted_sample_terms(self.terms, 4, recency_map=self.recency_map)
+        # Show term names immediately on each canvas
+        for i, term in enumerate(four):
+            canvas_show_message(self.labels[i], term.name, tag="status")
         extra = self.extra_var.get()
         urls = [None]*4; bytes_list = [None]*4
         round_hosts: set[str] = set()
@@ -366,6 +379,8 @@ class App:
                 alt = alt_list[0] if alt_list else None
                 if not alt: continue
                 exclude.add(alt.name)
+                # update canvas text for replaced term
+                canvas_show_message(self.labels[i], alt.name, tag="status")
                 used_set = self.used.get(alt.name, set())
                 url = None; data = None; h = None
                 candidates = ddg_candidates(alt.name, extra)
@@ -424,15 +439,10 @@ class App:
                     canvas_show_error(lbl, "Failed to load"); self.current_pils[i] = None
             else:
                 canvas_show_error(lbl, "Failed to load"); lbl.image = None; self.current_pils[i] = None
-        captions = []
-        base_dir = os.path.dirname(os.path.abspath(self.terms_path))
-        for i, term in enumerate(batch.terms):
-            u = batch.urls[i]; host = host_of(u) if u else ""
-            count = len(list(Path(os.path.join(base_dir, 'ranked_images', slugify(term.name))).glob('*.jpg')))
-            captions.append(f"{term.name}  ({term.rating:.0f}, g={term.games})  {host}  —  {count}×")
+        # Do not write captions under images and no hint in status
         for i in range(4):
-            self.captions[i].configure(text=captions[i])
-        self.status.set("Pick the best; click image to vote.")
+            self.captions[i].configure(text="")
+        # self.status.set("")  # keep whatever last message was
 
     # ---- Events ----
     def _on_canvas_resize(self, idx: int):
@@ -465,8 +475,8 @@ class App:
             alt_list = weighted_sample_terms(self.terms, 1, recency_map=self.recency_map, exclude=exclude)
             new_term = alt_list[0] if alt_list else None
             if new_term is None: return
+            canvas_show_message(self.labels[idx], new_term.name, tag="status")
             other_hosts = {host_of(u) for i, u in enumerate(self.current_urls) if i != idx and u}
-            from .images import ddg_candidates, download_image_bytes, looks_like_woman, phash_bytes, host_of, HOST_DIVERSITY_IN_FALLBACK
             url = None; data = None; h = None
             candidates = ddg_candidates(new_term.name, extra)
             if candidates:
@@ -504,8 +514,7 @@ class App:
                 else:
                     canvas_show_error(self.labels[idx], "Failed to load"); self.labels[idx].image=None
                     self.current_urls[idx]=None; self.current_raw_bytes[idx]=None; self.current_photos[idx]=None
-                host = host_of(self.current_urls[idx]) if self.current_urls[idx] else ""
-                self.captions[idx].configure(text=f"{new_term.name}  ({new_term.rating:.0f}, g={new_term.games})  {host}")
+                self.captions[idx].configure(text="")
                 self.status.set(f"Replaced with new term: {new_term.name}")
             self.root.after(0, apply)
         threading.Thread(target=worker, daemon=True).start()
@@ -529,54 +538,203 @@ class App:
             pass
 
 class GalleryWindow(tk.Toplevel):
+    BATCH_SIZE = 8  # images per "page" per term
+
     def __init__(self, app: "App"):
         super().__init__(app.root)
         self.title("All Ranked Images"); self.geometry("1200x800")
-        self.app = app; self._images: list[ImageTk.PhotoImage] = []
+        self.app = app
+        self._images: list[ImageTk.PhotoImage] = []
+        self.thumb_size_var = tk.IntVar(value=240)
+        self.sort_mode = tk.StringVar(value="rating_desc")  # default sort
+        self._term_offsets: dict[str, int] = {}  # term_dir -> next start index
+        self._thumb_cache: dict[tuple[str, int], ImageTk.PhotoImage] = {}  # (path, size) -> tk image
+
+        # container
         container = ttk.Frame(self); container.pack(fill=tk.BOTH, expand=True)
+
+        # top controls: size buttons and sorting buttons
+        top = ttk.Frame(container); top.pack(fill=tk.X, padx=10, pady=(8,0))
+        ttk.Label(top, text="Size:").pack(side=tk.LEFT)
+        for s in range(100, 1001, 100):
+            ttk.Button(top, text=str(s), command=lambda size=s: self._set_size(size)).pack(side=tk.LEFT, padx=2)
+        ttk.Label(top, text="   Sort:").pack(side=tk.LEFT, padx=(12,0))
+        sort_bar = ttk.Frame(top); sort_bar.pack(side=tk.LEFT)
+        def add_sort(label, key):
+            ttk.Button(sort_bar, text=label, command=lambda k=key: self._set_sort(k)).pack(side=tk.LEFT, padx=2)
+        add_sort("Alphabetical", "name_asc")
+        add_sort("Highest Rating", "rating_desc")
+        add_sort("Lowest Rating", "rating_asc")
+        add_sort("Games High", "games_desc")
+        add_sort("Games Low", "games_asc")
+        add_sort("Sigma High", "sigma_desc")
+        add_sort("Sigma Low", "sigma_asc")
+        ttk.Button(top, text="Refresh", command=self._refresh).pack(side=tk.RIGHT)
+
+        # scrollable canvas
         self.canvas = tk.Canvas(container, highlightthickness=0, bg="#111")
         vbar = ttk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=vbar.set)
         vbar.pack(side=tk.RIGHT, fill=tk.Y); self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.inner = ttk.Frame(self.canvas); self.inner_id = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
         self.inner.bind("<Configure>", self._on_frame_configure); self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self._build_rows()
+
+        self._build_rows_chunked()
+
+    def _set_size(self, size: int):
+        self.thumb_size_var.set(size)
+        self._refresh()
+
+    def _set_sort(self, mode: str):
+        self.sort_mode.set(mode)
+        self._refresh()
+
     def _on_frame_configure(self, event=None): self.canvas.configure(scrollregion=self.canvas.bbox("all"))
     def _on_canvas_configure(self, event): self.canvas.itemconfig(self.inner_id, width=event.width)
+
     def _refresh(self):
-        for w in list(self.inner.children.values()): 
+        for w in list(self.inner.children.values()):
             try: w.destroy()
             except Exception: pass
-        self._images.clear(); self._build_rows()
-    def _build_rows(self):
+        self._images.clear()
+        self._term_offsets.clear()
+        self._build_rows_chunked()
+
+    def _sorted_terms(self):
+        key = self.sort_mode.get()
+        terms = list(self.app.terms)
+        if key == "name_asc":
+            terms.sort(key=lambda t: t.name.casefold())
+        elif key == "rating_asc":
+            terms.sort(key=lambda t: t.rating)
+        elif key == "rating_desc":
+            terms.sort(key=lambda t: t.rating, reverse=True)
+        elif key == "games_asc":
+            terms.sort(key=lambda t: t.games)
+        elif key == "games_desc":
+            terms.sort(key=lambda t: t.games, reverse=True)
+        elif key == "sigma_asc":
+            terms.sort(key=lambda t: t.sigma)
+        elif key == "sigma_desc":
+            terms.sort(key=lambda t: t.sigma, reverse=True)
+        else:
+            terms.sort(key=lambda t: t.rating, reverse=True)
+        return terms
+
+    def _build_rows_chunked(self):
         base_dir = os.path.dirname(os.path.abspath(self.app.terms_path))
         ranked_dir = os.path.join(base_dir, "ranked_images")
-        terms_sorted = sorted(self.app.terms, key=lambda t: t.rating, reverse=True)
-        row = 0; found_any = False
+        terms_sorted = self._sorted_terms()
+        self._rows = []  # list of callables to build each term row lazily
+
         for term in terms_sorted:
             term_dir = os.path.join(ranked_dir, slugify(term.name))
-            if not os.path.isdir(term_dir): continue
-            hdr = ttk.Label(self.inner, text=f"{term.name}  ({int(round(term.rating))}, g={term.games})  —  {len(list(Path(term_dir).glob('*.jpg')))}×", font=("Segoe UI", 12, "bold"))
-            hdr.grid(row=row, column=0, sticky="w", padx=10, pady=(12, 4)); row += 1
-            wrap = ttk.Frame(self.inner); wrap.grid(row=row, column=0, sticky="ew", padx=10); row += 1
-            try: files = sorted([f for f in Path(term_dir).glob("*.jpg")], key=lambda p: p.name, reverse=True)
-            except Exception: files = []
-            if files: found_any = True
-            c = 0
-            for fp in files:
-                try:
+            if not os.path.isdir(term_dir): 
+                continue
+            files = sorted([f for f in Path(term_dir).glob("*.jpg")], key=lambda p: p.name, reverse=True)
+            if not files:
+                continue
+            def make_row_builder(term=term, term_dir=term_dir, files=files):
+                def builder():
+                    self._build_term_row(term, term_dir, files)
+                return builder
+            self._rows.append(make_row_builder())
+
+        self._build_next_row(0)
+
+    def _build_next_row(self, idx: int):
+        if idx >= len(self._rows):
+            return
+        try:
+            self._rows[idx]()  # build one row
+        except Exception:
+            pass
+        self.after(5, lambda: self._build_next_row(idx + 1))
+
+    def _build_term_row(self, term: Term, term_dir: str, files: list[Path]):
+        row = len(self.inner.grid_slaves())
+        count = len(files)
+        stats = f"rating {term.rating:.0f} | games {term.games} | sigma {term.sigma:.1f} | images {count}"
+        hdr = ttk.Label(self.inner, text=f"{term.name} — {stats}", font=("Segoe UI", 12, "bold"))
+        hdr.grid(row=row, column=0, sticky="w", padx=10, pady=(12, 4)); row += 1
+
+        wrap = ttk.Frame(self.inner); wrap.grid(row=row, column=0, sticky="ew", padx=10); row += 1
+        start = 0
+        page = self.BATCH_SIZE
+        self._term_offsets[term_dir] = start + page
+        subset = files[start:start+page]
+        self._render_thumbs_into(wrap, subset)
+
+        if len(files) > page:
+            btn = ttk.Button(self.inner, text="Load more…", command=lambda td=term_dir, f=files, w=wrap, b=None: self._on_load_more(td, f, w, b))
+            btn.grid(row=row, column=0, sticky="w", padx=10, pady=(6, 0))
+            btn.configure(command=lambda td=term_dir, f=files, w=wrap, b=btn: self._on_load_more(td, f, w, b))
+
+    def _on_load_more(self, term_dir: str, files: list[Path], wrap: ttk.Frame, btn: ttk.Button | None):
+        start = self._term_offsets.get(term_dir, 0)
+        page = self.BATCH_SIZE
+        subset = files[start:start+page]
+        self._render_thumbs_into(wrap, subset)
+        start += page
+        self._term_offsets[term_dir] = start
+        if start >= len(files) and btn is not None:
+            try: btn.destroy()
+            except Exception: pass
+
+    def _render_thumbs_into(self, parent: ttk.Frame, file_list: list[Path]):
+        if not file_list: return
+        size = int(self.thumb_size_var.get())
+        try: resample = Image.Resampling.LANCZOS
+        except Exception: resample = Image.ANTIALIAS  # type: ignore
+        c = 0
+        for fp in file_list:
+            try:
+                key = (str(fp), size)
+                if key in self._thumb_cache:
+                    tkimg = self._thumb_cache[key]
+                else:
                     pil = Image.open(fp).convert("RGB")
-                    try: resample = Image.Resampling.LANCZOS
-                    except Exception: resample = Image.ANTIALIAS  # type: ignore
-                    thumb_img = ImageOps.contain(pil, (240, 240), method=resample)
+                    thumb_img = ImageOps.contain(pil, (size, size), method=resample)
                     tkimg = ImageTk.PhotoImage(thumb_img)
-                    lbl = tk.Label(wrap, image=tkimg, bg="#111"); lbl.image = tkimg
-                    self._images.append(tkimg); lbl.grid(row=0, column=c, padx=6, pady=6); c += 1
-                except Exception:
-                    continue
-        if not found_any:
-            ttk.Label(self.inner, text="No saved images yet. Click a winner in the main window to save.").grid(row=row, column=0, sticky="w", padx=10, pady=12); row += 1
-            ttk.Button(self.inner, text="Refresh", command=self._refresh).grid(row=row, column=0, sticky="w", padx=10, pady=(0,12))
+                    if len(self._thumb_cache) > 800:
+                        try: self._thumb_cache.pop(next(iter(self._thumb_cache)))
+                        except Exception: pass
+                    self._thumb_cache[key] = tkimg
+                lbl = tk.Label(parent, image=tkimg, bg="#111", cursor="hand2")
+                lbl.image = tkimg
+                lbl.bind("<Button-1>", lambda e, path=str(fp): self._open_fullscreen(path))
+                lbl.grid(row=0, column=c, padx=6, pady=6); c += 1
+                self._images.append(tkimg)
+            except Exception:
+                continue
+
+    def _open_fullscreen(self, path: str):
+        FullscreenImageWindow(self, path)
+
+class FullscreenImageWindow(tk.Toplevel):
+    def __init__(self, parent: GalleryWindow, path: str):
+        super().__init__(parent)
+        self.title(os.path.basename(path))
+        self.attributes("-fullscreen", True)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Button-1>", lambda e: self.destroy())
+        self.canvas = tk.Canvas(self, bg="black", highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        # load image
+        self._pil = Image.open(path).convert("RGB")
+        self._tk = None
+        self.bind("<Configure>", self._on_resize)
+        self._on_resize()
+
+    def _on_resize(self, event=None):
+        w = self.winfo_width(); h = self.winfo_height()
+        if w <= 2 or h <= 2: return
+        try: resample = Image.Resampling.LANCZOS
+        except Exception: resample = Image.ANTIALIAS  # type: ignore
+        fitted = ImageOps.contain(self._pil, (w, h), method=resample)
+        self._tk = ImageTk.PhotoImage(fitted)
+        self.canvas.delete("img")
+        self.canvas.create_image(w//2, h//2, image=self._tk, anchor="center", tags="img")
 
 def main():
     if len(sys.argv) >= 2:
