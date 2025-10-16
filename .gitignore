@@ -1,0 +1,28 @@
+# Git Bash
+cd /c/GIT/SearchTermRating
+cat > .gitignore << 'EOF'
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+
+# Distribution / packaging
+.build/
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+EOF
+
+git add .gitignore
+git commit -m "chore: add .gitignore (venv, build, IDE)"
+git push
