@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+src/SearchTermRating/__init__.py
+src/SearchTermRating/__main__.py
+src/SearchTermRating/cli.py
+src/SearchTermRating/rating.py
+src/SearchTermRating.egg-info/PKG-INFO
+src/SearchTermRating.egg-info/SOURCES.txt
+src/SearchTermRating.egg-info/dependency_links.txt
+src/SearchTermRating.egg-info/entry_points.txt
+src/SearchTermRating.egg-info/requires.txt
+src/SearchTermRating.egg-info/top_level.txt

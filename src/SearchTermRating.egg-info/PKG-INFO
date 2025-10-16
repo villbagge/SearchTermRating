@@ -1,0 +1,117 @@
+Metadata-Version: 2.4
+Name: SearchTermRating
+Version: 0.1.0
+Summary: Rate and analyze search terms (initial scaffold)
+Author: Your Name
+License: MIT
+Keywords: search,rating,cli
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"
+Requires-Dist: ruff>=0.5; extra == "dev"
+Requires-Dist: mypy>=1.10; extra == "dev"
+
+\# SearchTermRating
+
+
+
+
+
+A refactor-friendly scaffold for rating and analyzing search terms.
+
+
+
+
+
+\## Quickstart
+
+
+
+
+
+```bash
+
+\# create and activate venv
+
+py -3 -m venv .venv
+
+.\\\\.venv\\\\Scripts\\\\Activate.ps1 # or .\\\\.venv\\\\Scripts\\\\activate.bat
+
+
+
+
+
+\# install in editable mode
+
+pip install -e ".\[dev]"
+
+
+
+
+
+\# run
+
+python -m SearchTermRating --help
+
+SearchTermRating --help
+
+
+
+\### 3.3 `.gitignore`
+
+
+
+
+
+```gitignore
+
+\# Byte-compiled / optimized / DLL files
+
+\_\_pycache\_\_/
+
+\*.py\[cod]
+
+\*$py.class
+
+
+
+
+
+\# Virtual environment
+
+.venv/
+
+
+
+
+
+\# Distribution / packaging
+
+.build/
+
+build/
+
+dist/
+
+.eggs/
+
+\*.egg-info/
+
+
+
+
+
+\# IDE/editor
+
+.vscode/
+
+.idea/
+
+\*.swp
+
+.DS\_Store
+

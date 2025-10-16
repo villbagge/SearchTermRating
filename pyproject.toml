@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "SearchTermRating"
+version = "0.1.0"
+description = "Rate and analyze search terms (initial scaffold)"
+readme = "README.md"
+authors = [{ name = "Your Name" }]
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["search", "rating", "cli"]
+classifiers = [
+"Programming Language :: Python :: 3",
+"License :: OSI Approved :: MIT License",
+"Operating System :: OS Independent",
+]
+
+
+# Console script for `SearchTermRating` on PATH
+[project.scripts]
+SearchTermRating = "SearchTermRating.cli:main"
+
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
+[project.optional-dependencies]
+# Editable dev extras (add tools you like)
+dev = [
+"pytest>=7",
+"ruff>=0.5", # linter/formatter
+"mypy>=1.10"
+]
