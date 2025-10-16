@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "termsranker"
+version = "0.1.0"
+description = "Interactive GUI to rank search terms by picking the best of 4 images."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Your Name" }]
+license = { text = "MIT" }
+
+dependencies = [
+  "ddgs>=2.0.0",
+  "requests>=2.31",
+  "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+vision = [
+  "opencv-python-headless>=4.8",
+  "numpy>=1.26",
+  "imagehash>=4.3",
+]
+deepface = [
+  "deepface>=0.0.92",
+  "numpy>=1.26",
+]
+
+[project.scripts]
+terms-ranker = "termsranker.app:main"
