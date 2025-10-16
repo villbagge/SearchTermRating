@@ -181,10 +181,8 @@ def looks_like_woman(data: bytes) -> bool:
         return True
     try:
         pil = Image.open(io.BytesIO(data)).convert("RGB")
-        arr = np.array(pil) if 'np' in globals() and np is not None else None
-        if arr is None:
-            import numpy as _np
-            arr = _np.array(pil)
+        import numpy as _np
+        arr = _np.array(pil)
         result = DeepFace.analyze(
             img_path=arr,
             actions=['gender'],
@@ -207,4 +205,5 @@ def looks_like_woman(data: bytes) -> bool:
             return True
         return prob_woman >= WOMAN_PROB_THRESHOLD
     except Exception:
-        return (not DEEPFACE_STRICT_ON_ERROR) == False  # strict -> reject
+        # Strict on error -> treat as failure (reject)
+        return not DEEPFACE_STRICT_ON_ERROR

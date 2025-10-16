@@ -6,14 +6,14 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk, ImageOps
 
-from .core import Term, elo_update, weighted_sample_terms
+from .core import Term, elo_update, weighted_sample_terms, COOLDOWN_WINDOW, COOLDOWN_MIN_FACTOR
 from .persistence import (
     load_terms, save_terms, used_cache_path, seen_hashes_path, load_used, save_used,
     load_seen_hashes, save_seen_hashes, slugify
 )
 from .images import (
     ddg_candidates, download_image_bytes, looks_like_woman, phash_bytes, host_of,
-    FACE_MIN_RATIO, HOST_DIVERSITY_IN_FALLBACK
+    HOST_DIVERSITY_IN_FALLBACK
 )
 
 PADDING = 12
@@ -58,7 +58,7 @@ class App:
         self.terms_path = terms_path
         self.terms: list[Term] = load_terms(terms_path)
         if not self.terms:
-            messagebox.showerror("No Terms", "The file is empty. Add terms (one per line) or 'term,rating'.")
+            messagebox.showerror("No Terms", "The file is empty. Add terms (one per line) or 'term,rating[,games,sigma]'.")
             sys.exit(1)
 
         # caches
@@ -66,6 +66,10 @@ class App:
         self.used = load_used(self.used_path)
         self.seen_hashes_path = seen_hashes_path(terms_path)
         self.seen_hashes = load_seen_hashes(self.seen_hashes_path)
+
+        # selection recency tracking
+        self.round_id = 0
+        self.recency_map: dict[str, int] = {}  # name -> rounds since last shown
 
         # UI state
         self.extra_var = tk.StringVar(value="")
@@ -173,7 +177,7 @@ class App:
         ttk.Label(frm, text="Select one or more terms to remove:").pack(anchor="w")
         lb = tk.Listbox(frm, selectmode=tk.EXTENDED, width=40, height=20); lb.pack(fill=tk.BOTH, expand=True, pady=6)
         sorted_terms = sorted(self.terms, key=lambda t: t.name.casefold())
-        for t in sorted_terms: lb.insert(tk.END, f"{t.name}  ({t.rating:.0f})")
+        for t in sorted_terms: lb.insert(tk.END, f"{t.name}  ({t.rating:.0f}, g={t.games})")
         btns = ttk.Frame(frm); btns.pack(fill=tk.X, pady=(8,0))
         def on_remove():
             selected_indices = lb.curselection()
@@ -201,11 +205,12 @@ class App:
         if not path: return
         terms = load_terms(path)
         if not terms:
-            messagebox.showerror("No Terms", "That file is empty. Add terms (one per line) or 'term,rating'."); return
+            messagebox.showerror("No Terms", "That file is empty. Add terms (one per line) or 'term,rating[,games,sigma]'."); return
         self.terms_path = path; self.terms = terms
         self.used_path = used_cache_path(path); self.seen_hashes_path = seen_hashes_path(path)
         self.used = load_used(self.used_path); self.seen_hashes = load_seen_hashes(self.seen_hashes_path)
         self.current_four = []; self.current_urls = [None]*4; self.current_raw_bytes = [None]*4; self.current_photos = [None]*4
+        self.recency_map.clear(); self.round_id = 0
         for lbl in self.labels: lbl.delete("all"); lbl.create_text(10,10,text="Loading…", anchor="nw", fill="#ddd", tags="status")
         for cap in self.captions: cap.configure(text="")
         with self.prefetch_lock: self.prefetch_queue.clear()
@@ -213,7 +218,7 @@ class App:
         self.status.set(f"Loaded {len(self.terms)} terms from {os.path.basename(path)}")
 
     def _open_settings(self):
-        from . import core
+        import termsranker.core as core
         import termsranker.images as images
         win = tk.Toplevel(self.root); win.title("Settings"); win.transient(self.root); win.grab_set()
         frm = ttk.Frame(win, padding=12); frm.pack(fill=tk.BOTH, expand=True)
@@ -223,7 +228,6 @@ class App:
         enforce_detect_var = tk.BooleanVar(value=images.DEEPFACE_ENFORCE_DETECTION)
         host_diverse_var = tk.BooleanVar(value=images.HOST_DIVERSITY_IN_FALLBACK)
         woman_thresh_var = tk.DoubleVar(value=images.WOMAN_PROB_THRESHOLD)
-        face_min_ratio_var = tk.DoubleVar(value=images.FACE_MIN_RATIO)
         safesearch_var = tk.StringVar(value=images.SAFESEARCH)
         ddg_max_var = tk.IntVar(value=images.DDG_MAX_RESULTS)
         topk_var = tk.IntVar(value=images.TOP_SAMPLE_K)
@@ -232,6 +236,9 @@ class App:
         unranked_boost_var = tk.DoubleVar(value=core.UNRANKED_BOOST * 100.0)
         highspread_boost_var = tk.DoubleVar(value=core.HIGH_SPREAD_BOOST * 100.0)
         spread_thresh_var = tk.DoubleVar(value=core.HIGH_SPREAD_THRESHOLD)
+        cooldown_window_var = tk.IntVar(value=core.COOLDOWN_WINDOW)
+        cooldown_min_factor_var = tk.DoubleVar(value=core.COOLDOWN_MIN_FACTOR)
+
         def add_row(r, label, widget):
             ttk.Label(frm, text=label).grid(row=r, column=0, sticky="w", pady=3)
             widget.grid(row=r, column=1, sticky="ew", pady=3)
@@ -241,7 +248,6 @@ class App:
         add_row(r, "Woman prob threshold", ttk.Entry(frm, textvariable=woman_thresh_var)); r+=1
         add_row(r, "DeepFace: enforce detection", ttk.Checkbutton(frm, variable=enforce_detect_var)); r+=1
         add_row(r, "DeepFace: strict on errors", ttk.Checkbutton(frm, variable=strict_err_var)); r+=1
-        add_row(r, "Face crop min ratio", ttk.Entry(frm, textvariable=face_min_ratio_var)); r+=1
         add_row(r, "DuckDuckGo SafeSearch", ttk.Combobox(frm, textvariable=safesearch_var, values=["off","moderate","strict"], state="readonly")); r+=1
         add_row(r, "DDG max results", ttk.Entry(frm, textvariable=ddg_max_var)); r+=1
         add_row(r, "Top sample K", ttk.Entry(frm, textvariable=topk_var)); r+=1
@@ -252,6 +258,9 @@ class App:
         add_row(r, "Unranked boost (%)", ttk.Entry(frm, textvariable=unranked_boost_var)); r+=1
         add_row(r, "High-spread boost (%)", ttk.Entry(frm, textvariable=highspread_boost_var)); r+=1
         add_row(r, "High-spread threshold (0–1)", ttk.Entry(frm, textvariable=spread_thresh_var)); r+=1
+        sep2 = ttk.Separator(frm, orient="horizontal"); sep2.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(8,6)); r+=1
+        add_row(r, "Cooldown window (rounds)", ttk.Entry(frm, textvariable=cooldown_window_var)); r+=1
+        add_row(r, "Cooldown min factor (0–1)", ttk.Entry(frm, textvariable=cooldown_min_factor_var)); r+=1
         btns = ttk.Frame(frm); btns.grid(row=r, column=0, columnspan=2, pady=(10,0), sticky="e")
         def apply_and_close():
             images.ENFORCE_WOMAN = bool(enforce_woman_var.get())
@@ -259,10 +268,6 @@ class App:
             except Exception: pass
             images.DEEPFACE_ENFORCE_DETECTION = bool(enforce_detect_var.get())
             images.DEEPFACE_STRICT_ON_ERROR = bool(strict_err_var.get())
-            images.HOST_DIVERSITY_IN_FALLBACK = bool(host_diverse_var.get())
-            try: 
-                images.FACE_MIN_RATIO = max(0.3, min(0.9, float(face_min_ratio_var.get())))
-            except Exception: pass
             images.SAFESEARCH = str(safesearch_var.get())
             try: images.DDG_MAX_RESULTS = max(10, int(ddg_max_var.get()))
             except Exception: pass
@@ -277,6 +282,10 @@ class App:
             try: core.HIGH_SPREAD_BOOST = max(0.0, float(highspread_boost_var.get()) / 100.0)
             except Exception: pass
             try: core.HIGH_SPREAD_THRESHOLD = max(0.0, min(1.0, float(spread_thresh_var.get())))
+            except Exception: pass
+            try: core.COOLDOWN_WINDOW = max(0, int(cooldown_window_var.get()))
+            except Exception: pass
+            try: core.COOLDOWN_MIN_FACTOR = max(0.0, min(1.0, float(cooldown_min_factor_var.get())))
             except Exception: pass
             win.destroy()
         ttk.Button(btns, text="OK", command=apply_and_close).pack(side=tk.RIGHT)
@@ -320,17 +329,10 @@ class App:
         return self._prefetch_round()
 
     # ---- Candidate picking & downloading ----
-    def _pick_new_term_for_slot(self, exclude_names: set[str]) -> Term | None:
-        from .core import weighted_sample_terms
-        pool = [t for t in self.terms if t.name not in exclude_names]
-        if not pool: return None
-        selected = weighted_sample_terms(pool, 1)
-        return selected[0] if selected else None
-
     def _prefetch_round(self) -> PrefetchBatch:
-        from .images import phash_bytes, looks_like_woman, host_of, ddg_candidates, download_image_bytes, HOST_DIVERSITY_IN_FALLBACK
         if len(self.terms) < 4: return PrefetchBatch([], [], [])
-        four = weighted_sample_terms(self.terms, 4)
+        # sample 4 with recency cooldown
+        four = weighted_sample_terms(self.terms, 4, recency_map=self.recency_map)
         extra = self.extra_var.get()
         urls = [None]*4; bytes_list = [None]*4
         round_hosts: set[str] = set()
@@ -355,12 +357,13 @@ class App:
                 if four[i].name not in self.used: self.used[four[i].name] = set()
                 self.used[four[i].name].add(url)
                 if h: self.seen_hashes.add(h)
-        # Second pass for failed slots
+        # Second pass for failed slots (try different terms)
         try:
             exclude = set(t.name for t in four)
             for i in range(4):
                 if bytes_list[i] is not None: continue
-                alt = self._pick_new_term_for_slot(exclude)
+                alt_list = weighted_sample_terms(self.terms, 1, recency_map=self.recency_map, exclude=exclude)
+                alt = alt_list[0] if alt_list else None
                 if not alt: continue
                 exclude.add(alt.name)
                 used_set = self.used.get(alt.name, set())
@@ -383,25 +386,21 @@ class App:
                     if alt.name not in self.used: self.used[alt.name] = set()
                     self.used[alt.name].add(url)
                     if h: self.seen_hashes.add(h)
+                    four[i] = alt
         except Exception:
             pass
         # persist caches (best-effort)
-        try: from .persistence import save_used, save_seen_hashes
-        except Exception: save_used = save_seen_hashes = None  # type: ignore
         try:
-            if save_used: save_used(self.used_path, self.used)
-        except Exception: pass
-        try:
-            if save_seen_hashes: save_seen_hashes(self.seen_hashes_path, self.seen_hashes)
-        except Exception: pass
-        # optional self-test
-        if SELF_TEST_EACH_BATCH:
-            try:
-                test_bytes = b""  # left empty in modular version
-                urls = ["selftest://checker"] * 4
-                bytes_list = [test_bytes] * 4
-            except Exception:
-                pass
+            save_used(self.used_path, self.used)
+            save_seen_hashes(self.seen_hashes_path, self.seen_hashes)
+        except Exception:
+            pass
+        # update recency map: increment all; set 0 for the ones shown this round
+        for k in list(self.recency_map.keys()):
+            self.recency_map[k] = min(self.recency_map[k] + 1, 10 * COOLDOWN_WINDOW if COOLDOWN_WINDOW else 999999)
+        for t in four:
+            self.recency_map[t.name] = 0
+        self.round_id += 1
         return PrefetchBatch(four, urls, bytes_list)
 
     # ---- Display ----
@@ -430,7 +429,7 @@ class App:
         for i, term in enumerate(batch.terms):
             u = batch.urls[i]; host = host_of(u) if u else ""
             count = len(list(Path(os.path.join(base_dir, 'ranked_images', slugify(term.name))).glob('*.jpg')))
-            captions.append(f"{term.name}  ({term.rating:.0f})  {host}  —  {count}×")
+            captions.append(f"{term.name}  ({term.rating:.0f}, g={term.games})  {host}  —  {count}×")
         for i in range(4):
             self.captions[i].configure(text=captions[i])
         self.status.set("Pick the best; click image to vote.")
@@ -463,7 +462,8 @@ class App:
             try: save_used(self.used_path, self.used)
             except Exception: pass
             exclude = {t.name for i, t in enumerate(self.current_four) if i != idx}
-            new_term = self._pick_new_term_for_slot(exclude)
+            alt_list = weighted_sample_terms(self.terms, 1, recency_map=self.recency_map, exclude=exclude)
+            new_term = alt_list[0] if alt_list else None
             if new_term is None: return
             other_hosts = {host_of(u) for i, u in enumerate(self.current_urls) if i != idx and u}
             from .images import ddg_candidates, download_image_bytes, looks_like_woman, phash_bytes, host_of, HOST_DIVERSITY_IN_FALLBACK
@@ -505,7 +505,7 @@ class App:
                     canvas_show_error(self.labels[idx], "Failed to load"); self.labels[idx].image=None
                     self.current_urls[idx]=None; self.current_raw_bytes[idx]=None; self.current_photos[idx]=None
                 host = host_of(self.current_urls[idx]) if self.current_urls[idx] else ""
-                self.captions[idx].configure(text=f"{new_term.name}  ({new_term.rating:.0f})  {host}")
+                self.captions[idx].configure(text=f"{new_term.name}  ({new_term.rating:.0f}, g={new_term.games})  {host}")
                 self.status.set(f"Replaced with new term: {new_term.name}")
             self.root.after(0, apply)
         threading.Thread(target=worker, daemon=True).start()
@@ -556,7 +556,7 @@ class GalleryWindow(tk.Toplevel):
         for term in terms_sorted:
             term_dir = os.path.join(ranked_dir, slugify(term.name))
             if not os.path.isdir(term_dir): continue
-            hdr = ttk.Label(self.inner, text=f"{term.name}  ({int(round(term.rating))})  —  {len(list(Path(term_dir).glob('*.jpg')))}×", font=("Segoe UI", 12, "bold"))
+            hdr = ttk.Label(self.inner, text=f"{term.name}  ({int(round(term.rating))}, g={term.games})  —  {len(list(Path(term_dir).glob('*.jpg')))}×", font=("Segoe UI", 12, "bold"))
             hdr.grid(row=row, column=0, sticky="w", padx=10, pady=(12, 4)); row += 1
             wrap = ttk.Frame(self.inner); wrap.grid(row=row, column=0, sticky="ew", padx=10); row += 1
             try: files = sorted([f for f in Path(term_dir).glob("*.jpg")], key=lambda p: p.name, reverse=True)
