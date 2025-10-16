@@ -15,6 +15,7 @@ from .persistence import (
 from .images import (
     ddg_candidates, download_image_bytes, looks_like_woman, phash_bytes, host_of
 )
+from .progress_3d import show_progress_3d  # NEW
 
 # -------------------- Config --------------------
 CONFIG_PATH = os.path.join(Path.home(), ".termsranker.json")
@@ -123,6 +124,10 @@ class App:
         self.current_urls: list[str | None] = [None]*4
         self.current_raw_bytes: list[bytes | None] = [None]*4
 
+        # progress UI (NEW)
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_label = None  # set in UI build
+
         # prefetch queue
         self.prefetch_lock = threading.Lock()
         self.prefetch_queue: list[PrefetchBatch] = []
@@ -140,8 +145,16 @@ class App:
         rightbar = ttk.Frame(top); rightbar.grid(row=0, column=1, sticky="e")
         for text, cmd in [("Gallery", self._open_gallery), ("Settings…", self._open_settings),
                           ("Open Terms File", self._open_file), ("Remove Terms…", self._open_remove_terms),
-                          ("Add Terms…", self._open_add_terms)]:
+                          ("Add Terms…", self._open_add_terms),
+                          ("Progress 3D…", self._open_progress3d)]:  # NEW
             ttk.Button(rightbar, text=text, command=cmd).pack(side=tk.LEFT, padx=(0,6))
+
+        # progress bar + label (to the right)
+        ttk.Label(rightbar, text="  ").pack(side=tk.LEFT)  # spacer
+        ttk.Progressbar(rightbar, orient="horizontal", length=180, mode="determinate",
+                        variable=self.progress_var).pack(side=tk.LEFT, padx=(0,6))
+        self.progress_label = ttk.Label(rightbar, text="Certainty: 0% (avg σ=0.00)")
+        self.progress_label.pack(side=tk.LEFT)
 
         grid = ttk.Frame(root, padding=0); grid.grid(row=1, column=0, sticky="nsew")
         for r in (0,1): grid.grid_rowconfigure(r, weight=1)
@@ -165,12 +178,22 @@ class App:
             # Placeholder so the window appears fast
             draw_title(cvs, "Loading…")
 
+        # initial progress draw
+        self._update_progress()
+
         self._start_initial_prefetch()
 
     # ---------- Menus ----------
     def _open_gallery(self):
         try: GalleryWindow(self)
         except Exception: pass
+
+    def _open_progress3d(self):  # NEW
+        if not self.terms:
+            messagebox.showwarning("No terms", "No terms loaded.")
+            return
+        # run in a thread so matplotlib window creation doesn't block Tk
+        threading.Thread(target=lambda: show_progress_3d(self.terms), daemon=True).start()
 
     def _existing_norm_names(self) -> set[str]:
         from .persistence import normalize_term
@@ -187,6 +210,7 @@ class App:
             self.terms.append(Term(name)); existing.add(norm); added += 1
         try: save_terms(self.terms_path, self.terms)
         except Exception: pass
+        self._update_progress()  # NEW
         return added, skipped
 
     def _open_add_terms(self):
@@ -223,6 +247,7 @@ class App:
             except Exception: pass
             win.destroy()
             with self.prefetch_lock: self.prefetch_queue.clear(); self._start_initial_prefetch()
+            self._update_progress()  # NEW
         ttk.Button(btns, text="Remove Selected", command=on_remove).pack(side=tk.RIGHT)
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=(0,8))
 
@@ -239,6 +264,7 @@ class App:
         self.recency_map.clear(); self.round_id = 0
         for lbl in self.labels: lbl.delete("all"); draw_title(lbl, "Loading…")
         with self.prefetch_lock: self.prefetch_queue.clear()
+        self._update_progress()  # NEW
         self._start_initial_prefetch()
 
     def _open_settings(self):
@@ -416,6 +442,28 @@ class App:
                 self.current_pils[i] = None
                 canvas_show_error(lbl, "No image"); draw_title(lbl, term.name)
 
+        # Update progress after displaying a new batch (cheap)
+        self._update_progress()  # NEW
+
+    # ---------- Progress (NEW) ----------
+    def _calc_progress(self) -> tuple[float, float]:
+        if not self.terms:
+            return 0.0, 0.0
+        # progress = mean(clip(1 - sigma/3.0, 0, 1))
+        total = 0.0
+        for t in self.terms:
+            total += max(0.0, min(1.0, 1.0 - (t.sigma / 3.0)))
+        progress = total / max(1, len(self.terms))
+        avg_sigma = sum(t.sigma for t in self.terms) / max(1, len(self.terms))
+        return progress, avg_sigma
+
+    def _update_progress(self):
+        progress, avg_sigma = self._calc_progress()
+        pct = int(round(progress * 100))
+        self.progress_var.set(pct)
+        if self.progress_label is not None:
+            self.progress_label.config(text=f"Certainty: {pct}% (avg σ={avg_sigma:.2f})")
+
     # ---------- Events ----------
     def _on_canvas_resize(self, idx: int):
         try:
@@ -436,6 +484,8 @@ class App:
         elo_update(winner, losers)
         try: save_terms(self.terms_path, self.terms)
         except Exception: pass
+        # Update progress immediately after a vote
+        self._update_progress()  # NEW
         # Fetch and show a fresh, coherent batch
         batch = self._consume_prefetch_or_fetch()
         self._display_batch(batch)
@@ -506,6 +556,8 @@ class App:
                             draw_debug(lbl, host_of(url) if url else "-")
                     except Exception:
                         self.current_pils[idx] = None
+                # OTHER doesn't change sigma/games, but keep UI fresh
+                self._update_progress()  # NEW (cheap)
             self.root.after(0, apply)
         threading.Thread(target=worker, daemon=True).start()
 
