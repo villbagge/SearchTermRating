@@ -1,133 +1,183 @@
 from __future__ import annotations
-import os, io, shutil, time
+import os, re, hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Dict
-from PIL import Image
+from typing import Dict, List, Tuple
+
 from .persistence import slugify
 from .images import phash_bytes
 
-# Fixed parameters
-THRESHOLD = 4  # Hamming distance threshold for similarity (lower = stricter)
+# ----- Tuning -----
+# Hamming distance threshold for perceptual duplicates.
+# 0 = identical phash; 1-3 = very similar; try 2 (your current setting)
+THRESHOLD = 2
+
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+FNAME_RE = re.compile(
+    r"^(?P<slug>.+?)_(?P<rating>-?\d+?)_(?P<ts>\d{8}-\d{6})\.(?P<ext>jpg|jpeg|png|webp|bmp|tif|tiff)$",
+    re.IGNORECASE
+)
 
 @dataclass
-class ImgInfo:
+class ImgMeta:
     path: Path
-    phash: int
-    size: Tuple[int, int]  # (w,h)
-    bytes: int
+    size: int
     mtime: float
+    sha1: str
+    phash: str | None
+    rating: int | None
 
-def _read_phash(path: Path) -> ImgInfo | None:
+def _sha1_bytes(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+def _load_meta(fp: Path) -> ImgMeta | None:
     try:
-        data = path.read_bytes()
-        h = phash_bytes(data)
-        if not h:
-            return None
-        with Image.open(io.BytesIO(data)) as im:
-            im = im.convert("RGB")
-            w, hpx = im.size
-        st = path.stat()
-        return ImgInfo(
-            path=path,
-            phash=int(h, 16) if isinstance(h, str) else int(h),
-            size=(w, hpx),
-            bytes=st.st_size,
-            mtime=st.st_mtime,
-        )
+        data = fp.read_bytes()
     except Exception:
         return None
+    try:
+        phex = phash_bytes(data)  # may return None
+    except Exception:
+        phex = None
+    try:
+        st = fp.stat()
+        size = st.st_size
+        mtime = st.st_mtime
+    except Exception:
+        size = 0
+        mtime = 0.0
+    sha1 = _sha1_bytes(data)
+    # try parse rating from name
+    rating = None
+    m = FNAME_RE.match(fp.name)
+    if m:
+        try:
+            rating = int(m.group("rating"))
+        except Exception:
+            rating = None
+    return ImgMeta(path=fp, size=size, mtime=mtime, sha1=sha1, phash=phex, rating=rating)
 
-def _hamming(a: int, b: int) -> int:
-    return (a ^ b).bit_count()
+def _ham(a_hex: str, b_hex: str) -> int:
+    try:
+        return bin(int(a_hex, 16) ^ int(b_hex, 16)).count("1")
+    except Exception:
+        return 9999
 
-def _choose_keeper(files: List[ImgInfo]) -> ImgInfo:
-    def score(info: ImgInfo):
-        w, h = info.size
-        return (w*h, info.bytes, info.mtime)
-    return max(files, key=score)
+def _pick_best(imgs: List[ImgMeta]) -> ImgMeta:
+    # Prefer highest rating; if missing tie, prefer newest mtime; then shortest path (stable)
+    imgs_sorted = sorted(
+        imgs,
+        key=lambda m: (
+            -(m.rating if m.rating is not None else -10**9),  # None rating => lowest priority
+            -m.mtime,
+            len(str(m.path))
+        )
+    )
+    return imgs_sorted[0]
 
-def _cluster_by_phash(infos: List[ImgInfo], threshold: int) -> List[List[ImgInfo]]:
-    clusters: List[List[ImgInfo]] = []
-    reps: List[int] = []
-    for info in infos:
-        placed = False
-        for i, rep in enumerate(reps):
-            if _hamming(info.phash, rep) <= threshold:
-                clusters[i].append(info)
-                placed = True
-                break
-        if not placed:
-            clusters.append([info])
-            reps.append(info.phash)
+def _cluster_within_threshold(imgs: List[ImgMeta], threshold: int) -> List[List[ImgMeta]]:
+    """Greedy clustering: exact SHA1 groups first, then pHash groups with threshold."""
+    remaining = list(imgs)
+    clusters: List[List[ImgMeta]] = []
+
+    # Step 1: exact-duplicate clusters by SHA1
+    by_sha: Dict[str, List[ImgMeta]] = {}
+    for m in remaining:
+        by_sha.setdefault(m.sha1, []).append(m)
+    for sha, group in list(by_sha.items()):
+        if len(group) > 1:
+            clusters.append(group)
+    # Remove those from remaining so we don't re-cluster them
+    clustered_paths = {m.path for group in clusters for m in group}
+    remaining = [m for m in remaining if m.path not in clustered_paths]
+
+    # Step 2: perceptual clusters (greedy)
+    used = set()
+    for i, m in enumerate(remaining):
+        if m.path in used:
+            continue
+        group = [m]
+        used.add(m.path)
+        for j in range(i+1, len(remaining)):
+            n = remaining[j]
+            if n.path in used:
+                continue
+            if not m.phash or not n.phash:
+                continue  # can't compare
+            if _ham(m.phash, n.phash) <= threshold:
+                group.append(n)
+                used.add(n.path)
+        if len(group) > 1:
+            clusters.append(group)
+
     return clusters
 
-def _iter_term_dirs(ranked_dir: Path) -> List[Path]:
-    if not ranked_dir.exists():
+def _collect_term_dirs(base_dir: Path) -> List[Path]:
+    ranked_dir = (base_dir / "ranked_images")
+    if not ranked_dir.is_dir():
         return []
-    return sorted([p for p in ranked_dir.iterdir() if p.is_dir()])
+    return [p for p in ranked_dir.iterdir() if p.is_dir()]
 
-def dedupe_ranked_images(base_dir: Path) -> Dict[str, Dict[str, int]]:
-    ranked_dir = base_dir / "ranked_images"
-    summary: Dict[str, Dict[str, int]] = {"terms": {}, "totals": {"kept": 0, "deleted": 0, "scanned": 0}}
+def _list_images(term_dir: Path) -> List[Path]:
+    return [p for p in term_dir.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS]
 
-    for term_dir in _iter_term_dirs(ranked_dir):
-        files = sorted(term_dir.glob("*.jpg"))
-        if not files:
+def dedupe_ranked_images(base_dir: Path, threshold: int = THRESHOLD) -> dict:
+    """
+    Walk ranked_images/<term> folders.
+    Find exact and perceptual duplicates, keep the best, delete the rest.
+    Returns a summary dict with totals.
+    """
+    base_dir = Path(base_dir)
+    term_dirs = _collect_term_dirs(base_dir)
+
+    totals = {"scanned": 0, "kept": 0, "deleted": 0, "clusters": 0}
+    per_term: Dict[str, Dict[str, int]] = {}
+
+    for term_dir in term_dirs:
+        files = _list_images(term_dir)
+        metas: List[ImgMeta] = []
+        for f in files:
+            m = _load_meta(f)
+            if m:
+                metas.append(m)
+        if not metas:
             continue
-        infos: List[ImgInfo] = []
-        for p in files:
-            info = _read_phash(p)
-            if info:
-                infos.append(info)
 
-        summary["totals"]["scanned"] += len(infos)
-        if not infos:
+        totals["scanned"] += len(metas)
+        per_term_stats = {"scanned": len(metas), "kept": 0, "deleted": 0, "clusters": 0}
+
+        clusters = _cluster_within_threshold(metas, threshold=threshold)
+        if not clusters:
+            per_term_stats["kept"] += len(metas)
+            totals["kept"] += len(metas)
+            per_term[term_dir.name] = per_term_stats
             continue
 
-        clusters = _cluster_by_phash(infos, THRESHOLD)
-        kept = deleted = 0
+        # Mark files to delete in each cluster
+        to_delete: List[Path] = []
+        for group in clusters:
+            per_term_stats["clusters"] += 1
+            best = _pick_best(group)
+            # delete all except the best
+            for m in group:
+                if m.path != best.path:
+                    to_delete.append(m.path)
 
-        for cluster in clusters:
-            if len(cluster) <= 1:
-                kept += 1
-                continue
-            keep = _choose_keeper(cluster)
-            kept += 1
-            for dup in cluster:
-                if dup.path == keep.path:
-                    continue
-                try:
-                    dup.path.unlink(missing_ok=True)
-                    deleted += 1
-                except Exception:
-                    pass
+        # Apply deletions
+        deleted_count = 0
+        for fp in to_delete:
+            try:
+                os.remove(fp)
+                deleted_count += 1
+            except Exception:
+                pass
 
-        summary["terms"][term_dir.name] = {
-            "kept": kept,
-            "deleted": deleted,
-            "clusters": len(clusters)
-        }
-        summary["totals"]["kept"] += kept
-        summary["totals"]["deleted"] += deleted
+        kept_count = len(metas) - deleted_count
+        per_term_stats["deleted"] += deleted_count
+        per_term_stats["kept"] += kept_count
+        totals["deleted"] += deleted_count
+        totals["kept"] += kept_count
+        totals["clusters"] += per_term_stats["clusters"]
+        per_term[term_dir.name] = per_term_stats
 
-    return summary
-
-def main():
-    import argparse
-    ap = argparse.ArgumentParser(description="Remove visually redundant images (auto-delete).")
-    ap.add_argument("--terms", required=True, help="Path to your terms file (to locate ranked_images next to it).")
-    args = ap.parse_args()
-
-    terms_path = Path(args.terms).expanduser().resolve()
-    base_dir = terms_path.parent
-
-    summary = dedupe_ranked_images(base_dir)
-    print("Dedup summary (threshold=10, duplicates deleted):")
-    for term, stats in sorted(summary["terms"].items()):
-        print(f"  {term:30s} kept={stats['kept']:3d} deleted={stats['deleted']:3d} clusters={stats['clusters']:3d}")
-    t = summary["totals"]
-    print(f"\nTotals: scanned={t['scanned']} kept={t['kept']} deleted={t['deleted']}")
-
-if __name__ == "__main__":
-    main()
+    return {"totals": totals, "per_term": per_term, "threshold": threshold}
