@@ -7,6 +7,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk, ImageOps
 
+import termsranker.images as images
+import termsranker.core as core
 from .core import Term, elo_update, weighted_sample_terms, COOLDOWN_WINDOW
 from .persistence import (
     load_terms, save_terms, used_cache_path, seen_hashes_path, load_used, save_used,
@@ -15,13 +17,32 @@ from .persistence import (
 from .images import (
     ddg_candidates, download_image_bytes, looks_like_woman, phash_bytes, host_of
 )
-from .progress_3d import show_progress_3d  # NEW
 
-# -------------------- Config --------------------
 CONFIG_PATH = os.path.join(Path.home(), ".termsranker.json")
 PADDING = 6
 GRID_GAP = 2
-DEBUG_OVERLAY = True  # set False to hide host text on tiles
+DEBUG_OVERLAY = True
+
+SETTINGS_DEFAULTS = {
+    "cooldown_window": 10,
+    "recency_cap_factor": 10,
+    "enforce_woman": True,
+    "face_required": True,
+    "face_min_frac": 0.18,
+    "face_min_neighbors": 4,
+    "face_scale_factor": 1.10,
+    "min_dim": 256,
+    "ddg_max_results": 60,
+    "top_sample_k": 8,
+    "timeout": 7,
+    "unique_hosts_per_round": True,
+    "avoid_dup_hashes": True,
+    "prefetch_max_queue": 2,
+    "use_used_url_cache": True,
+    "use_seen_hash_cache": True,
+    "gallery_batch_size": 8,
+    "gallery_vis_buffer": 800,
+}
 
 def load_config() -> dict:
     try:
@@ -33,37 +54,40 @@ def save_config(cfg: dict):
         with open(CONFIG_PATH, "w", encoding="utf-8") as f: json.dump(cfg, f, indent=2)
     except Exception: pass
 
-# -------------------- Canvas helpers (main thread only) --------------------
+def cfg_get():
+    cfg = load_config()
+    for k, v in SETTINGS_DEFAULTS.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+def cfg_save(cfg: dict):
+    for k, v in SETTINGS_DEFAULTS.items():
+        cfg.setdefault(k, v)
+    save_config(cfg)
+
 def draw_title(canvas: "tk.Canvas", text: str):
-    # persistent label at top-left
     try:
         canvas.delete("title")
         canvas.create_text(8, 8, text=text, anchor="nw", fill="#ddd", tags="title")
-    except Exception:
-        pass
+    except Exception: pass
 
 def draw_debug(canvas: "tk.Canvas", text: str):
     if not DEBUG_OVERLAY: return
-    try:
-        w = max(1, int(canvas.winfo_width()))
-    except Exception:
-        w = 400
+    try: w = max(1, int(canvas.winfo_width()))
+    except Exception: w = 400
     try:
         canvas.delete("dbg")
         canvas.create_text(w-8, 8, text=text, anchor="ne", fill="#aaa", font=("Segoe UI", 9), tags="dbg")
-    except Exception:
-        pass
+    except Exception: pass
 
 def canvas_show_error(canvas: "tk.Canvas", msg: str):
     try:
         canvas.delete("img"); canvas.delete("err")
         w = max(1, int(canvas.winfo_width())); h = max(1, int(canvas.winfo_height()))
         canvas.create_text(w//2, h//2, text=msg, fill="#ddd", tags="err")
-    except Exception:
-        pass
+    except Exception: pass
 
 def render_to_canvas(canvas: "tk.Canvas", pil_img: Image.Image):
-    # Render image but DO NOT touch 'title' or 'dbg' tags so labels persist.
     try:
         w = max(1, int(canvas.winfo_width())); h = max(1, int(canvas.winfo_height()))
     except Exception:
@@ -77,7 +101,34 @@ def render_to_canvas(canvas: "tk.Canvas", pil_img: Image.Image):
     canvas.create_image(w//2, h//2, image=tkimg, anchor="center", tags="img")
     canvas.image = tkimg
 
-# -------------------- Prefetch types (atomic / coherent) --------------------
+def _has_face_bytes(data: bytes) -> bool:
+    cfg = cfg_get()
+    if not cfg.get("face_required", True):
+        return True
+    try:
+        import cv2, numpy as np
+    except Exception:
+        return True
+    try:
+        nparr = np.frombuffer(data, dtype=np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None: return True
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+        face_min_frac = float(cfg.get("face_min_frac", 0.18))
+        min_size = max(16, int(max(h, w) * face_min_frac))
+        cascade_path = getattr(cv2.data, "haarcascades", "") + "haarcascade_frontalface_default.xml"
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=float(cfg.get("face_scale_factor", 1.10)),
+            minNeighbors=int(cfg.get("face_min_neighbors", 4)),
+            minSize=(min_size, min_size)
+        )
+        return bool(faces)
+    except Exception:
+        return True
+
 @dataclass(frozen=True)
 class PrefetchEntry:
     term: Term
@@ -86,12 +137,20 @@ class PrefetchEntry:
 
 @dataclass(frozen=True)
 class PrefetchBatch:
-    entries: list[PrefetchEntry]  # length 4
+    entries: list[PrefetchEntry]
 
-# -------------------- App --------------------
 class App:
     def __init__(self, root: tk.Tk, terms_path: str | None):
         self.root = root
+        cfg = cfg_get()
+        # apply immediate settings
+        core.COOLDOWN_WINDOW = int(cfg.get("cooldown_window", 10))
+        images.ENFORCE_WOMAN = bool(cfg.get("enforce_woman", True))
+        images.MIN_DIM = int(cfg.get("min_dim", 256))
+        images.DDG_MAX_RESULTS = int(cfg.get("ddg_max_results", 60))
+        images.TOP_SAMPLE_K = int(cfg.get("top_sample_k", 8))
+        images.TIMEOUT = int(cfg.get("timeout", 7))
+
         self.terms_path = terms_path or load_config().get("last_terms_path")
         if not self.terms_path:
             self.terms_path = filedialog.askopenfilename(
@@ -99,22 +158,19 @@ class App:
                 filetypes=[("Text/CSV","*.txt *.csv"),("All files","*.*")]
             )
             if not self.terms_path: print("No file selected."); sys.exit(0)
-        cfg = load_config(); cfg["last_terms_path"] = self.terms_path; save_config(cfg)
+        cfg2 = load_config(); cfg2["last_terms_path"] = self.terms_path; save_config(cfg2)
 
         self.terms: list[Term] = load_terms(self.terms_path)
         if not self.terms:
             messagebox.showerror("No Terms","The file is empty. Add terms (one per line) or 'term,rating[,games,sigma]'.")
             sys.exit(1)
 
-        # caches
         self.used_path = used_cache_path(self.terms_path); self.used = load_used(self.used_path)
         self.seen_hashes_path = seen_hashes_path(self.terms_path); self.seen_hashes = load_seen_hashes(self.seen_hashes_path)
 
-        # selection recency
         self.round_id = 0
         self.recency_map: dict[str,int] = {}
 
-        # UI state
         self.extra_var = tk.StringVar(value="")
         self.frames: list[ttk.Frame] = []
         self.labels: list[tk.Canvas] = []
@@ -124,17 +180,17 @@ class App:
         self.current_urls: list[str | None] = [None]*4
         self.current_raw_bytes: list[bytes | None] = [None]*4
 
-        # progress UI (NEW)
         self.progress_var = tk.DoubleVar(value=0.0)
-        self.progress_label = None  # set in UI build
+        self.progress_label = None
 
-        # prefetch queue
         self.prefetch_lock = threading.Lock()
         self.prefetch_queue: list[PrefetchBatch] = []
 
-        # ---- UI ----
         self.root.title("Terms Ranker")
         root.grid_rowconfigure(1, weight=1); root.grid_columnconfigure(0, weight=1)
+
+        style = ttk.Style(self.root)
+        style.configure("Other.TButton", font=("Segoe UI", 12, "bold"), padding=(14, 10))
 
         top = ttk.Frame(root, padding=PADDING); top.grid(row=0, column=0, sticky="ew")
         top.grid_columnconfigure(0, weight=1)
@@ -146,11 +202,10 @@ class App:
         for text, cmd in [("Gallery", self._open_gallery), ("Settings…", self._open_settings),
                           ("Open Terms File", self._open_file), ("Remove Terms…", self._open_remove_terms),
                           ("Add Terms…", self._open_add_terms),
-                          ("Progress 3D…", self._open_progress3d)]:  # NEW
+                          ("Progress 3D…", self._open_progress3d)]:
             ttk.Button(rightbar, text=text, command=cmd).pack(side=tk.LEFT, padx=(0,6))
 
-        # progress bar + label (to the right)
-        ttk.Label(rightbar, text="  ").pack(side=tk.LEFT)  # spacer
+        ttk.Label(rightbar, text="  ").pack(side=tk.LEFT)
         ttk.Progressbar(rightbar, orient="horizontal", length=180, mode="determinate",
                         variable=self.progress_var).pack(side=tk.LEFT, padx=(0,6))
         self.progress_label = ttk.Label(rightbar, text="Certainty: 0% (avg σ=0.00)")
@@ -167,33 +222,40 @@ class App:
             cvs = tk.Canvas(slot, highlightthickness=0, bg="#222"); cvs.grid(row=0, column=0, sticky="nsew")
             cvs.bind("<Configure>", lambda e, idx=i: self._on_canvas_resize(idx))
             cvs.bind("<Button-1>", lambda e, idx=i: self._on_click(idx))
-            btn = ttk.Button(cvs, text="OTHER", command=lambda idx=i: self._on_other(idx))
+            btn = ttk.Button(cvs, text="OTHER", style="Other.TButton", command=lambda idx=i: self._on_other(idx))
             def place_btn(canvas=cvs, b=btn):
                 try:
                     w = max(1, canvas.winfo_width()); h = max(1, canvas.winfo_height())
-                    b.place(x=w-8, y=h-8, anchor="se")
+                    b.place(x=w-10, y=h-10, anchor="se")
                 except Exception: pass
             cvs.bind("<Configure>", lambda e, pb=place_btn: pb()); place_btn()
             self.frames.append(slot); self.labels.append(cvs); self.overlay_btns.append(btn)
-            # Placeholder so the window appears fast
             draw_title(cvs, "Loading…")
 
-        # initial progress draw
         self._update_progress()
-
         self._start_initial_prefetch()
 
-    # ---------- Menus ----------
     def _open_gallery(self):
         try: GalleryWindow(self)
         except Exception: pass
 
-    def _open_progress3d(self):  # NEW
+    def _open_progress3d(self):
         if not self.terms:
             messagebox.showwarning("No terms", "No terms loaded.")
             return
-        # run in a thread so matplotlib window creation doesn't block Tk
-        threading.Thread(target=lambda: show_progress_3d(self.terms), daemon=True).start()
+        def runner():
+            try:
+                from .progress_3d import show_progress_3d
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Matplotlib missing",
+                    "The 3D view requires matplotlib.\n\nFix in PowerShell:\n"
+                    "  .\\.venv\\Scripts\\Activate.ps1\n  pip install matplotlib\n\n"
+                    f"Details: {e}"
+                ))
+                return
+            show_progress_3d(self.terms)
+        threading.Thread(target=runner, daemon=True).start()
 
     def _existing_norm_names(self) -> set[str]:
         from .persistence import normalize_term
@@ -210,7 +272,7 @@ class App:
             self.terms.append(Term(name)); existing.add(norm); added += 1
         try: save_terms(self.terms_path, self.terms)
         except Exception: pass
-        self._update_progress()  # NEW
+        self._update_progress()
         return added, skipped
 
     def _open_add_terms(self):
@@ -247,7 +309,7 @@ class App:
             except Exception: pass
             win.destroy()
             with self.prefetch_lock: self.prefetch_queue.clear(); self._start_initial_prefetch()
-            self._update_progress()  # NEW
+            self._update_progress()
         ttk.Button(btns, text="Remove Selected", command=on_remove).pack(side=tk.RIGHT)
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=(0,8))
 
@@ -264,43 +326,134 @@ class App:
         self.recency_map.clear(); self.round_id = 0
         for lbl in self.labels: lbl.delete("all"); draw_title(lbl, "Loading…")
         with self.prefetch_lock: self.prefetch_queue.clear()
-        self._update_progress()  # NEW
+        self._update_progress()
         self._start_initial_prefetch()
 
     def _open_settings(self):
-        import termsranker.images as images
-        win = tk.Toplevel(self.root); win.title("Settings"); win.transient(self.root); win.grab_set()
-        frm = ttk.Frame(win, padding=12); frm.pack(fill=tk.BOTH, expand=True)
-        enforce_woman_var = tk.BooleanVar(value=images.ENFORCE_WOMAN)
-        ddg_max_var = tk.IntVar(value=images.DDG_MAX_RESULTS)
-        topk_var = tk.IntVar(value=images.TOP_SAMPLE_K)
-        min_dim_var = tk.IntVar(value=images.MIN_DIM)
-        timeout_var = tk.IntVar(value=images.TIMEOUT)
-        def add_row(r, label, widget):
-            ttk.Label(frm, text=label).grid(row=r, column=0, sticky="w", pady=3)
-            widget.grid(row=r, column=1, sticky="ew", pady=3)
-        frm.columnconfigure(1, weight=1); r=0
-        add_row(r, "Require woman filter", ttk.Checkbutton(frm, variable=enforce_woman_var)); r+=1
-        add_row(r, "DDG max results", ttk.Entry(frm, textvariable=ddg_max_var)); r+=1
-        add_row(r, "Top sample K", ttk.Entry(frm, textvariable=topk_var)); r+=1
-        add_row(r, "Minimum image dim", ttk.Entry(frm, textvariable=min_dim_var)); r+=1
-        add_row(r, "HTTP timeout (s)", ttk.Entry(frm, textvariable=timeout_var)); r+=1
-        def apply_and_close():
-            images.ENFORCE_WOMAN = bool(enforce_woman_var.get())
-            try: images.DDG_MAX_RESULTS = max(10, int(ddg_max_var.get()))
-            except Exception: pass
-            try: images.TOP_SAMPLE_K = max(1, int(topk_var.get()))
-            except Exception: pass
-            try: images.MIN_DIM = max(0, int(min_dim_var.get()))
-            except Exception: pass
-            try: images.TIMEOUT = max(1, int(timeout_var.get()))
-            except Exception: pass
-            win.destroy()
-        ttk.Button(frm, text="OK", command=apply_and_close).grid(row=r, column=1, sticky="e", pady=(8,0))
+        cfg = cfg_get()
 
-    # ---------- Prefetch orchestration ----------
+        win = tk.Toplevel(self.root)
+        win.title("Settings")
+        win.transient(self.root)
+        win.grab_set()
+
+        outer = ttk.Frame(win, padding=12)
+        outer.pack(fill=tk.BOTH, expand=True)
+        outer.columnconfigure(1, weight=1)
+
+        def add_group(title):
+            lab = ttk.Label(outer, text=title, font=("Segoe UI", 11, "bold"))
+            lab.grid(column=0, row=add_group.r, columnspan=3, sticky="w", pady=(10, 4))
+            add_group.r += 1
+        add_group.r = 0
+
+        def add_bool(label, key, note=None):
+            var = tk.BooleanVar(value=bool(cfg.get(key, SETTINGS_DEFAULTS[key])))
+            row = add_group.r
+            ttk.Label(outer, text=label).grid(row=row, column=0, sticky="w", padx=(0,10))
+            ttk.Checkbutton(outer, variable=var).grid(row=row, column=1, sticky="w")
+            if note: ttk.Label(outer, text=note, foreground="#888").grid(row=row, column=2, sticky="w")
+            add_group.r += 1
+            return var
+
+        def add_int(label, key, rng, note=None):
+            val = int(cfg.get(key, SETTINGS_DEFAULTS[key]))
+            var = tk.IntVar(value=val)
+            row = add_group.r
+            ttk.Label(outer, text=label).grid(row=row, column=0, sticky="w", padx=(0,10))
+            sp = ttk.Spinbox(outer, from_=rng[0], to=rng[1], increment=1, textvariable=var, width=8)
+            sp.grid(row=row, column=1, sticky="w")
+            if note: ttk.Label(outer, text=note, foreground="#888").grid(row=row, column=2, sticky="w")
+            add_group.r += 1
+            return var
+
+        def add_float(label, key, rng, step, note=None):
+            val = float(cfg.get(key, SETTINGS_DEFAULTS[key]))
+            var = tk.DoubleVar(value=val)
+            row = add_group.r
+            ttk.Label(outer, text=label).grid(row=row, column=0, sticky="w", padx=(0,10))
+            sp = ttk.Spinbox(outer, from_=rng[0], to=rng[1], increment=step, textvariable=var, width=8)
+            sp.grid(row=row, column=1, sticky="w")
+            if note: ttk.Label(outer, text=note, foreground="#888").grid(row=row, column=2, sticky="w")
+            add_group.r += 1
+            return var
+
+        # A. Selection
+        add_group("A. Selection")
+        v_cooldown = add_int("Cooldown window (1) [0..999]", "cooldown_window", (0, 999), "Lower = can reappear sooner")
+        v_recency_cap = add_int("Recency cap factor (2) [1..100]", "recency_cap_factor", (1, 100), "Cap = factor × cooldown")
+
+        # B. Image filtering
+        add_group("B. Image filtering")
+        v_enf_woman = add_bool("Require “woman” filter (4)", "enforce_woman")
+        v_face_req = add_bool("Require face detection (5)", "face_required")
+        v_face_frac = add_float("Face min size fraction (6) [0.05..0.6]", "face_min_frac", (0.05, 0.6), 0.01, "Higher = closer/larger faces")
+        v_face_neigh = add_int("Face min neighbors (7) [1..10]", "face_min_neighbors", (1, 10), "Higher = stricter")
+        v_face_scale = add_float("Face scale factor (8) [1.05..1.5]", "face_scale_factor", (1.05, 1.5), 0.01, "Lower = slower but more sensitive")
+        v_min_dim = add_int("Minimum image dimension px (9) [0..2000]", "min_dim", (0, 2000))
+
+        # C. Search & networking
+        add_group("C. Search & networking")
+        v_ddg_max = add_int("DuckDuckGo max results (10) [10..200]", "ddg_max_results", (10, 200))
+        v_topk = add_int("Candidate top-K (11) [1..50]", "top_sample_k", (1, 50))
+        v_timeout = add_int("HTTP timeout seconds (12) [1..60]", "timeout", (1, 60))
+
+        # D. Prefetch & caching
+        add_group("D. Prefetch & caching")
+        v_unique_host = add_bool("Enforce unique host per round (13)", "unique_hosts_per_round", "Avoid all 4 from same site")
+        v_avoid_dup = add_bool("Avoid duplicate images (pHash) (14)", "avoid_dup_hashes", "Skip near-duplicates globally")
+        v_pref_q = add_int("Prefetch queue max batches (15) [0..6]", "prefetch_max_queue", (0, 6), "Higher = smoother UX, more IO")
+        v_use_used = add_bool("Use per-term used-URL cache (16)", "use_used_url_cache", "Remember URLs shown for a term")
+        v_use_seen = add_bool("Use global seen-hash cache (17)", "use_seen_hash_cache", "Avoid dupes across sessions")
+
+        # E. Gallery
+        add_group("E. Gallery (All ranked images)")
+        v_g_batch = add_int("Thumbs 'load more' batch size (24) [4..40]", "gallery_batch_size", (4, 40), "* requires restart of Gallery window")
+        v_g_vis = add_int("Scroll prefetch buffer px (25) [200..4000]", "gallery_vis_buffer", (200, 4000), "* requires restart of Gallery window")
+
+        btns = ttk.Frame(outer); btns.grid(row=add_group.r, column=0, columnspan=3, sticky="e", pady=(12,0))
+        def on_ok():
+            cfg["cooldown_window"] = int(v_cooldown.get())
+            cfg["recency_cap_factor"] = int(v_recency_cap.get())
+
+            cfg["enforce_woman"] = bool(v_enf_woman.get())
+            cfg["face_required"] = bool(v_face_req.get())
+            cfg["face_min_frac"] = float(v_face_frac.get())
+            cfg["face_min_neighbors"] = int(v_face_neigh.get())
+            cfg["face_scale_factor"] = float(v_face_scale.get())
+            cfg["min_dim"] = int(v_min_dim.get())
+
+            cfg["ddg_max_results"] = int(v_ddg_max.get())
+            cfg["top_sample_k"] = int(v_topk.get())
+            cfg["timeout"] = int(v_timeout.get())
+
+            cfg["unique_hosts_per_round"] = bool(v_unique_host.get())
+            cfg["avoid_dup_hashes"] = bool(v_avoid_dup.get())
+            cfg["prefetch_max_queue"] = int(v_pref_q.get())
+            cfg["use_used_url_cache"] = bool(v_use_used.get())
+            cfg["use_seen_hash_cache"] = bool(v_use_seen.get())
+
+            cfg["gallery_batch_size"] = int(v_g_batch.get())
+            cfg["gallery_vis_buffer"] = int(v_g_vis.get())
+
+            cfg_save(cfg)
+
+            try:
+                core.COOLDOWN_WINDOW = cfg["cooldown_window"]
+                images.ENFORCE_WOMAN = cfg["enforce_woman"]
+                images.MIN_DIM = int(cfg["min_dim"])
+                images.DDG_MAX_RESULTS = int(cfg["ddg_max_results"])
+                images.TOP_SAMPLE_K = int(cfg["top_sample_k"])
+                images.TIMEOUT = int(cfg["timeout"])
+            except Exception:
+                pass
+
+            win.destroy()
+
+        ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=(0,8))
+
     def _start_initial_prefetch(self):
-        # Only one batch to reduce startup delay
         def worker():
             batch = self._prefetch_round()
             self.root.after(0, lambda: self._display_batch(batch))
@@ -311,8 +464,9 @@ class App:
         try:
             while True:
                 batch = self._prefetch_round()
+                max_q = int(cfg_get().get("prefetch_max_queue", 2))
                 with self.prefetch_lock:
-                    if len(self.prefetch_queue) >= 2: break
+                    if len(self.prefetch_queue) >= max_q: break
                     self.prefetch_queue.append(batch)
         except Exception:
             pass
@@ -325,41 +479,47 @@ class App:
             return batch
         return self._prefetch_round()
 
-    # ---------- Candidate picking (NO UI in worker) ----------
     def _prefetch_round(self) -> PrefetchBatch:
+        cfg = cfg_get()
         if len(self.terms) < 4: return PrefetchBatch(entries=[])
 
-        # sample 4 with recency cooldown
         four = weighted_sample_terms(self.terms, 4, recency_map=self.recency_map)
-
         extra = self.extra_var.get()
         round_hosts: set[str] = set()
-        used_sets = [self.used.get(t.name, set()) for t in four]
+
+        use_used = cfg.get("use_used_url_cache", True)
+        used_sets = [self.used.get(t.name, set()) if use_used else set() for t in four]
+
         urls: list[str | None] = [None]*4
         datas: list[bytes | None] = [None]*4
         hashes: list[str | None] = [None]*4
+
+        avoid_dup = cfg.get("avoid_dup_hashes", True)
+        unique_hosts = cfg.get("unique_hosts_per_round", True)
 
         # primary pass
         for i, term in enumerate(four):
             candidates = ddg_candidates(term.name, extra)
             if candidates:
                 for u in candidates:
-                    if u in used_sets[i]: continue
+                    if use_used and u in used_sets[i]: continue
                     hst = host_of(u)
-                    if hst and hst in round_hosts: continue
+                    if unique_hosts and hst and hst in round_hosts: continue
                     d = download_image_bytes(u, u)
                     if not d: continue
                     if not looks_like_woman(d): continue
+                    if cfg.get("face_required", True) and not _has_face_bytes(d): continue
                     hh = phash_bytes(d)
-                    if hh and hh in self.seen_hashes: continue
+                    if avoid_dup and hh and hh in self.seen_hashes: continue
                     urls[i], datas[i], hashes[i] = u, d, hh
                     round_hosts.add(hst)
-                    if term.name not in self.used: self.used[term.name] = set()
-                    self.used[term.name].add(u)
-                    if hh: self.seen_hashes.add(hh)
+                    if use_used:
+                        if term.name not in self.used: self.used[term.name] = set()
+                        self.used[term.name].add(u)
+                    if avoid_dup and hh: self.seen_hashes.add(hh)
                     break
 
-        # fallback: swap in alternate terms for failed slots
+        # fallback: alternate terms
         try:
             exclude = set(t.name for t in four)
             for i in range(4):
@@ -368,52 +528,51 @@ class App:
                 alt = alt_list[0] if alt_list else None
                 if not alt: continue
                 exclude.add(alt.name)
-                used_set = self.used.get(alt.name, set())
+                used_set = self.used.get(alt.name, set()) if use_used else set()
                 cand = ddg_candidates(alt.name, extra)
                 url = None; data = None; hh = None
                 if cand:
                     for u in cand:
-                        if u in used_set: continue
+                        if use_used and u in used_set: continue
                         hst = host_of(u)
-                        if hst and hst in round_hosts: continue
+                        if unique_hosts and hst and hst in round_hosts: continue
                         d = download_image_bytes(u, u)
                         if not d: continue
                         if not looks_like_woman(d): continue
+                        if cfg.get("face_required", True) and not _has_face_bytes(d): continue
                         hh2 = phash_bytes(d)
-                        if hh2 and hh2 in self.seen_hashes: continue
+                        if avoid_dup and hh2 and hh2 in self.seen_hashes: continue
                         url, data, hh = u, d, hh2
                         round_hosts.add(hst); break
                 urls[i], datas[i], hashes[i] = url, data, hh
                 if url:
-                    if alt.name not in self.used: self.used[alt.name] = set()
-                    self.used[alt.name].add(url)
-                    if hh: self.seen_hashes.add(hh)
+                    if use_used:
+                        if alt.name not in self.used: self.used[alt.name] = set()
+                        self.used[alt.name].add(url)
+                    if avoid_dup and hh: self.seen_hashes.add(hh)
                     four[i] = alt
         except Exception:
             pass
 
-        # persist caches best-effort
         try:
-            save_used(self.used_path, self.used); save_seen_hashes(self.seen_hashes_path, self.seen_hashes)
+            if use_used: save_used(self.used_path, self.used)
+            if avoid_dup: save_seen_hashes(self.seen_hashes_path, self.seen_hashes)
         except Exception:
             pass
 
-        # recency update
+        cap = int(cfg.get("recency_cap_factor", 10)) * int(core.COOLDOWN_WINDOW or 1)
         for k in list(self.recency_map.keys()):
-            self.recency_map[k] = min(self.recency_map[k] + 1, 10 * COOLDOWN_WINDOW if COOLDOWN_WINDOW else 999999)
+            self.recency_map[k] = min(self.recency_map[k] + 1, cap)
         for t in four: self.recency_map[t.name] = 0
         self.round_id += 1
 
-        # Build atomic entries
         entries = [PrefetchEntry(term=four[i], url=urls[i], data=datas[i]) for i in range(4)]
         return PrefetchBatch(entries=entries)
 
-    # ---------- Display (main thread only) ----------
     def _display_batch(self, batch: PrefetchBatch):
         if not batch.entries or len(batch.entries) != 4:
             messagebox.showerror("Need more terms","At least 4 terms are required."); return
 
-        # Atomically replace current state from the entries list
         self.current_four = [e.term for e in batch.entries]
         self.current_urls = [e.url for e in batch.entries]
         self.current_raw_bytes = [e.data for e in batch.entries]
@@ -442,19 +601,20 @@ class App:
                 self.current_pils[i] = None
                 canvas_show_error(lbl, "No image"); draw_title(lbl, term.name)
 
-        # Update progress after displaying a new batch (cheap)
-        self._update_progress()  # NEW
+        self._update_progress()
 
-    # ---------- Progress (NEW) ----------
     def _calc_progress(self) -> tuple[float, float]:
         if not self.terms:
             return 0.0, 0.0
-        # progress = mean(clip(1 - sigma/3.0, 0, 1))
+        sigmas = [t.sigma for t in self.terms]
+        if not sigmas:
+            return 0.0, 0.0
+        sigma0 = max(sigmas) if max(sigmas) > 10 else 3.0
         total = 0.0
-        for t in self.terms:
-            total += max(0.0, min(1.0, 1.0 - (t.sigma / 3.0)))
-        progress = total / max(1, len(self.terms))
-        avg_sigma = sum(t.sigma for t in self.terms) / max(1, len(self.terms))
+        for s in sigmas:
+            total += max(0.0, min(1.0, 1.0 - (s / sigma0)))
+        progress = total / max(1, len(sigmas))
+        avg_sigma = sum(sigmas) / max(1, len(sigmas))
         return progress, avg_sigma
 
     def _update_progress(self):
@@ -464,7 +624,6 @@ class App:
         if self.progress_label is not None:
             self.progress_label.config(text=f"Certainty: {pct}% (avg σ={avg_sigma:.2f})")
 
-    # ---------- Events ----------
     def _on_canvas_resize(self, idx: int):
         try:
             pil = self.current_pils[idx]; cvs = self.labels[idx]
@@ -478,15 +637,11 @@ class App:
     def _on_click(self, idx: int):
         if not self.current_four or idx >= len(self.current_four): return
         winner = self.current_four[idx]; losers = [t for i, t in enumerate(self.current_four) if i != idx]
-        # Save winning image (best-effort)
         self._save_winning_image_uncropped(idx, winner)
-        # Update ratings
         elo_update(winner, losers)
         try: save_terms(self.terms_path, self.terms)
         except Exception: pass
-        # Update progress immediately after a vote
-        self._update_progress()  # NEW
-        # Fetch and show a fresh, coherent batch
+        self._update_progress()
         batch = self._consume_prefetch_or_fetch()
         self._display_batch(batch)
 
@@ -494,9 +649,15 @@ class App:
         if not self.current_four or idx >= len(self.current_four): return
         old_term = self.current_four[idx]; extra = self.extra_var.get()
         def worker():
-            self.used[old_term.name] = set()
-            try: save_used(self.used_path, self.used)
-            except Exception: pass
+            cfg = cfg_get()
+            use_used = cfg.get("use_used_url_cache", True)
+            avoid_dup = cfg.get("avoid_dup_hashes", True)
+            unique_hosts = cfg.get("unique_hosts_per_round", True)
+
+            if use_used:
+                self.used[old_term.name] = set()
+                try: save_used(self.used_path, self.used)
+                except Exception: pass
 
             exclude = {t.name for i, t in enumerate(self.current_four) if i != idx}
             alt_list = weighted_sample_terms(self.terms, 1, recency_map=self.recency_map, exclude=exclude)
@@ -510,17 +671,18 @@ class App:
             def try_candidates(cands, respect_hosts=True):
                 nonlocal url, data, hh
                 if not cands: return False
-                used_set = self.used.get(new_term.name, set())
+                used_set = self.used.get(new_term.name, set()) if use_used else set()
                 for u in cands:
-                    if u in used_set: continue
-                    if respect_hosts:
+                    if use_used and u in used_set: continue
+                    if respect_hosts and unique_hosts:
                         hst = host_of(u)
                         if hst and hst in other_hosts: continue
                     d = download_image_bytes(u, u)
                     if not d: continue
                     if not looks_like_woman(d): continue
+                    if cfg.get("face_required", True) and not _has_face_bytes(d): continue
                     hhash = phash_bytes(d)
-                    if hhash and hhash in self.seen_hashes: continue
+                    if avoid_dup and hhash and hhash in self.seen_hashes: continue
                     url, data, hh = u, d, hhash
                     return True
                 return False
@@ -528,12 +690,12 @@ class App:
             ok = try_candidates(candidates, True)
             if not ok: ok = try_candidates(candidates, False)
 
-            if url:
+            if url and use_used:
                 if new_term.name not in self.used: self.used[new_term.name] = set()
                 self.used[new_term.name].add(url)
                 try: save_used(self.used_path, self.used)
                 except Exception: pass
-            if hh:
+            if hh and cfg.get("avoid_dup_hashes", True):
                 self.seen_hashes.add(hh)
                 try: save_seen_hashes(self.seen_hashes_path, self.seen_hashes)
                 except Exception: pass
@@ -556,12 +718,10 @@ class App:
                             draw_debug(lbl, host_of(url) if url else "-")
                     except Exception:
                         self.current_pils[idx] = None
-                # OTHER doesn't change sigma/games, but keep UI fresh
-                self._update_progress()  # NEW (cheap)
+                self._update_progress()
             self.root.after(0, apply)
         threading.Thread(target=worker, daemon=True).start()
 
-    # ---------- Save winning image ----------
     def _save_winning_image_uncropped(self, idx: int, term: Term):
         data = self.current_raw_bytes[idx]
         if not data: return
@@ -577,23 +737,25 @@ class App:
         try: pil.save(path, format="JPEG", quality=90)
         except Exception: pass
 
-# -------------------- Entry --------------------
 def main():
     arg_path = sys.argv[1] if len(sys.argv) >= 2 else None
     root = tk.Tk(); root.geometry("1300x1000"); root.minsize(900, 700)
     App(root, arg_path); root.mainloop()
 
-# -------------------- Gallery (unchanged core behavior) --------------------
 class GalleryWindow(tk.Toplevel):
-    BATCH_SIZE = 8
-    VIS_BUFFER = 800
+    BATCH_SIZE = SETTINGS_DEFAULTS["gallery_batch_size"]
+    VIS_BUFFER = SETTINGS_DEFAULTS["gallery_vis_buffer"]
 
     def __init__(self, app: "App"):
         super().__init__(app.root)
+        gcfg = cfg_get()
+        type(self).BATCH_SIZE = int(gcfg.get("gallery_batch_size", SETTINGS_DEFAULTS["gallery_batch_size"]))
+        type(self).VIS_BUFFER = int(gcfg.get("gallery_vis_buffer", SETTINGS_DEFAULTS["gallery_vis_buffer"]))
+
         self.title("All Ranked Images"); self.geometry("1200x800")
         self.app = app
         self._images: list[ImageTk.PhotoImage] = []
-        self.thumb_height_var = tk.IntVar(value=200)  # default height
+        self.thumb_height_var = tk.IntVar(value=200)
         self.sort_mode = tk.StringVar(value="rating_desc")
         self._thumb_cache: dict[tuple[str, int], ImageTk.PhotoImage] = {}
         self._row_widgets: list[tuple[ttk.Frame, dict]] = []
@@ -687,7 +849,7 @@ class GalleryWindow(tk.Toplevel):
         try:
             top = int(self.canvas.canvasy(0)); bottom = int(self.canvas.canvasy(self.canvas.winfo_height()))
         except Exception: return
-        top -= 800; bottom += 800
+        top -= int(cfg_get().get("gallery_vis_buffer", 800)); bottom += int(cfg_get().get("gallery_vis_buffer", 800))
         for row_frame, meta in self._row_widgets:
             try:
                 ry0 = row_frame.winfo_y(); ry1 = ry0 + row_frame.winfo_height()
@@ -697,7 +859,7 @@ class GalleryWindow(tk.Toplevel):
 
     def _build_row_content(self, meta: dict):
         files = meta["files"]; wrap: ttk.Frame = meta["wrap"]
-        start = 0; page = 8; subset = files[start:start+page]
+        start = 0; page = int(cfg_get().get("gallery_batch_size", 8)); subset = files[start:start+page]
         self._render_thumbs_async(wrap, subset)
         meta["start"] = start + page; meta["built"] = True
         if len(files) > page:
@@ -706,7 +868,7 @@ class GalleryWindow(tk.Toplevel):
             btn.configure(command=lambda m=meta, b=btn: self._on_load_more(m, b))
 
     def _on_load_more(self, meta: dict, btn: ttk.Button | None):
-        files = meta["files"]; start = meta.get("start", 0); page = 8
+        files = meta["files"]; start = meta.get("start", 0); page = int(cfg_get().get("gallery_batch_size", 8))
         subset = files[start:start+page]
         self._render_thumbs_async(meta["wrap"], subset)
         start += page; meta["start"] = start
