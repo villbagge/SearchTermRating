@@ -12,7 +12,7 @@ import termsranker.core as core
 from .core import Term, elo_update, weighted_sample_terms, COOLDOWN_WINDOW
 from .persistence import (
     load_terms, save_terms, used_cache_path, seen_hashes_path, load_used, save_used,
-    load_seen_hashes, save_seen_hashes, slugify
+    load_seen_hashes, save_seen_hashes, slugify, normalize_term
 )
 from .images import (
     ddg_candidates, download_image_bytes, looks_like_woman, phash_bytes, host_of
@@ -53,6 +53,9 @@ SETTINGS_DEFAULTS = {
     # E. Gallery (requires restart of Gallery window to feel effect)
     "gallery_batch_size": 8,        # (#24) int [4..40]  *requires restart
     "gallery_vis_buffer": 800,      # (#25) int [200..4000] *requires restart
+
+    # F. Instant OTHER
+    "spare_per_slot": 1,            # number of prefetched replacements per slot
 }
 
 def load_config() -> dict:
@@ -215,6 +218,10 @@ class App:
         self.prefetch_lock = threading.Lock()
         self.prefetch_queue: list[PrefetchBatch] = []
 
+        # ---- NEW: per-slot spares for instant OTHER ----
+        self.spares_lock = threading.Lock()
+        self.spares: list[list[PrefetchEntry]] = [[] for _ in range(4)]
+
         # ---- UI ----
         self.root.title("Terms Ranker")
         root.grid_rowconfigure(1, weight=1); root.grid_columnconfigure(0, weight=1)
@@ -233,9 +240,7 @@ class App:
         rightbar = ttk.Frame(top); rightbar.grid(row=0, column=1, sticky="e")
         for text, cmd in [("Gallery", self._open_gallery), ("Settings…", self._open_settings),
                           ("Open Terms File", self._open_file), ("Remove Terms…", self._open_remove_terms),
-                          ("Add Terms…", self._open_add_terms),
-                          ("Progress 3D…", self._open_progress3d),
-                          ("DeDupe", self._run_dedupe)]:
+                          ("Add Terms…", self._open_add_terms)]:
             ttk.Button(rightbar, text=text, command=cmd).pack(side=tk.LEFT, padx=(0,6))
 
         # progress bar + label (to the right)
@@ -304,6 +309,8 @@ class App:
         # Stop prefetcher from queuing further work
         with self.prefetch_lock:
             self.prefetch_queue.clear()
+        with self.spares_lock:
+            for q in self.spares: q.clear()
         # Explicitly drop all PhotoImages before Tk dies (avoid __del__ on non-main-thread)
         try:
             for cvs in self.labels:
@@ -325,136 +332,10 @@ class App:
             pass
         self.root.destroy()
 
-    # ---------- Menus ----------
+    # ---------- Menu handlers (RESTORED) ----------
     def _open_gallery(self):
         try: GalleryWindow(self)
         except Exception: pass
-
-    def _open_progress3d(self):
-        if not self.terms:
-            messagebox.showwarning("No terms", "No terms loaded.")
-            return
-        def runner():
-            try:
-                from .progress_3d import show_progress_3d
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Matplotlib missing",
-                    "The 3D view requires matplotlib.\n\nFix in PowerShell:\n"
-                    "  .\\.venv\\Scripts\\Activate.ps1\n  pip install matplotlib\n\n"
-                    f"Details: {e}"
-                ))
-                return
-            show_progress_3d(self.terms)
-        threading.Thread(target=runner, daemon=True).start()
-
-    def _run_dedupe(self):
-        # Lazily import the dedupe tool; uses THRESHOLD set in termsranker.dedupe (you set it to 2)
-        try:
-            from .dedupe import dedupe_ranked_images, THRESHOLD
-        except Exception as e:
-            messagebox.showerror("DeDupe", f"Couldn't import dedupe tool.\n\nDetails: {e}")
-            return
-        if not self.terms_path:
-            messagebox.showwarning("DeDupe", "No terms file loaded.")
-            return
-        confirm = messagebox.askyesno(
-            "DeDupe",
-            f"This will permanently delete visually redundant images\n"
-            f"(threshold = {THRESHOLD}).\n\nProceed?"
-        )
-        if not confirm:
-            return
-        def worker():
-            try:
-                base_dir = Path(self.terms_path).expanduser().resolve().parent
-                summary = dedupe_ranked_images(base_dir)
-                t = summary.get("totals", {})
-                msg_lines = [
-                    "Deduplication completed.",
-                    f"Threshold: {THRESHOLD}",
-                    f"Scanned:   {t.get('scanned', 0)}",
-                    f"Kept:      {t.get('kept', 0)}",
-                    f"Deleted:   {t.get('deleted', 0)}",
-                ]
-                self.root.after(0, lambda: messagebox.showinfo("DeDupe", "\n".join(msg_lines)))
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("DeDupe failed", str(e)))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _existing_norm_names(self) -> set[str]:
-        from .persistence import normalize_term
-        return {normalize_term(t.name) for t in self.terms}
-
-    def add_terms_from_list(self, names: list[str]) -> tuple[int, list[str]]:
-        existing = self._existing_norm_names(); added = 0; skipped: list[str] = []
-        for raw in names:
-            name = (raw or "").strip()
-            if not name: continue
-            from .persistence import normalize_term
-            norm = normalize_term(name)
-            if norm in existing: skipped.append(name); continue
-            self.terms.append(Term(name)); existing.add(norm); added += 1
-        try: self._save_terms_atomic()
-        except Exception: pass
-        self._update_progress()
-        return added, skipped
-
-    def _open_add_terms(self):
-        win = tk.Toplevel(self.root); win.title("Add Terms (one per line)"); win.transient(self.root); win.grab_set()
-        frm = ttk.Frame(win, padding=12); frm.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frm, text="Paste new terms, one per line. Existing ones will be skipped.").pack(anchor="w", pady=(0,6))
-        txt = tk.Text(frm, width=50, height=16); txt.pack(fill=tk.BOTH, expand=True)
-        btns = ttk.Frame(frm); btns.pack(fill=tk.X, pady=(8,0))
-        def on_add():
-            raw = txt.get("1.0","end"); names = [s.strip() for s in raw.splitlines() if s.strip()]
-            self.add_terms_from_list(names); win.destroy()
-            with self.prefetch_lock: self.prefetch_queue.clear(); self._start_initial_prefetch()
-        ttk.Button(btns, text="Add", command=on_add).pack(side=tk.RIGHT)
-        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=(0,8))
-
-    def _open_remove_terms(self):
-        win = tk.Toplevel(self.root); win.title("Remove Terms"); win.transient(self.root); win.grab_set()
-        frm = ttk.Frame(win, padding=12); frm.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frm, text="Select one or more terms to remove:").pack(anchor="w")
-        lb = tk.Listbox(frm, selectmode=tk.EXTENDED, width=40, height=20); lb.pack(fill=tk.BOTH, expand=True, pady=6)
-        sorted_terms = sorted(self.terms, key=lambda t: t.name.casefold())
-        for t in sorted_terms: lb.insert(tk.END, f"{t.name}  ({t.rating:.0f}, g={t.games})")
-        btns = ttk.Frame(frm); btns.pack(fill=tk.X, pady=(8,0))
-        def on_remove():
-            sel = lb.curselection()
-            if not sel: win.destroy(); return
-            to_remove = [sorted_terms[i] for i in sel]
-            names = [t.name for t in to_remove]
-            self.terms = [t for t in self.terms if t not in to_remove]
-            for nm in names:
-                try: del self.used[nm]
-                except Exception: pass
-            try:
-                self._save_terms_atomic()
-                self._save_used_atomic()
-            except Exception: pass
-            win.destroy()
-            with self.prefetch_lock: self.prefetch_queue.clear(); self._start_initial_prefetch()
-            self._update_progress()
-        ttk.Button(btns, text="Remove Selected", command=on_remove).pack(side=tk.RIGHT)
-        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=(0,8))
-
-    def _open_file(self):
-        path = filedialog.askopenfilename(title="Select terms file", filetypes=[("Text/CSV","*.txt *.csv"),("All files","*.*")])
-        if not path: return
-        terms = load_terms(path)
-        if not terms: messagebox.showerror("No Terms","That file is empty."); return
-        self.terms_path = path; cfg = load_config(); cfg["last_terms_path"] = path; save_config(cfg)
-        self.terms = terms
-        self.used_path = used_cache_path(path); self.seen_hashes_path = seen_hashes_path(path)
-        self.used = load_used(self.used_path); self.seen_hashes = load_seen_hashes(self.seen_hashes_path)
-        self.current_four = []; self.current_urls = [None]*4; self.current_raw_bytes = [None]*4; self.current_pils = [None]*4
-        self.recency_map.clear(); self.round_id = 0
-        for lbl in self.labels: lbl.delete("all"); draw_title(lbl, "Loading…")
-        with self.prefetch_lock: self.prefetch_queue.clear()
-        self._update_progress()
-        self._start_initial_prefetch()
 
     def _open_settings(self):
         cfg = cfg_get()
@@ -538,6 +419,10 @@ class App:
         v_g_batch = add_int("Thumbs 'load more' batch size (24) [4..40]", "gallery_batch_size", (4, 40), "* requires restart of Gallery window")
         v_g_vis = add_int("Scroll prefetch buffer px (25) [200..4000]", "gallery_vis_buffer", (200, 4000), "* requires restart of Gallery window")
 
+        # F. Instant OTHER
+        add_group("F. Instant OTHER")
+        v_spares = add_int("Spare replacements per slot [0..3]", "spare_per_slot", (0, 3), "Higher = faster OTHER x2/x3, more traffic")
+
         btns = ttk.Frame(outer); btns.grid(row=add_group.r, column=0, columnspan=3, sticky="e", pady=(12,0))
         def on_ok():
             cfg["cooldown_window"] = int(v_cooldown.get())
@@ -563,6 +448,8 @@ class App:
             cfg["gallery_batch_size"] = int(v_g_batch.get())
             cfg["gallery_vis_buffer"] = int(v_g_vis.get())
 
+            cfg["spare_per_slot"] = int(v_spares.get())
+
             cfg_save(cfg)
 
             try:
@@ -580,6 +467,78 @@ class App:
         ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=(0,8))
 
+    def _open_file(self):
+        path = filedialog.askopenfilename(title="Select terms file", filetypes=[("Text/CSV","*.txt *.csv"),("All files","*.*")])
+        if not path: return
+        terms = load_terms(path)
+        if not terms: messagebox.showerror("No Terms","That file is empty."); return
+        self.terms_path = path; cfg = load_config(); cfg["last_terms_path"] = path; save_config(cfg)
+        self.terms = terms
+        self.used_path = used_cache_path(path); self.seen_hashes_path = seen_hashes_path(path)
+        self.used = load_used(self.used_path); self.seen_hashes = load_seen_hashes(self.seen_hashes_path)
+        self.current_four = []; self.current_urls = [None]*4; self.current_raw_bytes = [None]*4; self.current_pils = [None]*4
+        self.recency_map.clear(); self.round_id = 0
+        for lbl in self.labels: lbl.delete("all"); draw_title(lbl, "Loading…")
+        with self.prefetch_lock: self.prefetch_queue.clear()
+        self._update_progress()
+        self._start_initial_prefetch()
+
+    def _existing_norm_names(self) -> set[str]:
+        return {normalize_term(t.name) for t in self.terms}
+
+    def add_terms_from_list(self, names: list[str]) -> tuple[int, list[str]]:
+        existing = self._existing_norm_names(); added = 0; skipped: list[str] = []
+        for raw in names:
+            name = (raw or "").strip()
+            if not name: continue
+            norm = normalize_term(name)
+            if norm in existing: skipped.append(name); continue
+            self.terms.append(Term(name)); existing.add(norm); added += 1
+        try: self._save_terms_atomic()
+        except Exception: pass
+        self._update_progress()
+        return added, skipped
+
+    def _open_add_terms(self):
+        win = tk.Toplevel(self.root); win.title("Add Terms (one per line)"); win.transient(self.root); win.grab_set()
+        frm = ttk.Frame(win, padding=12); frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text="Paste new terms, one per line. Existing ones will be skipped.").pack(anchor="w", pady=(0,6))
+        txt = tk.Text(frm, width=50, height=16); txt.pack(fill=tk.BOTH, expand=True)
+        btns = ttk.Frame(frm); btns.pack(fill=tk.X, pady=(8,0))
+        def on_add():
+            raw = txt.get("1.0","end"); names = [s.strip() for s in raw.splitlines() if s.strip()]
+            self.add_terms_from_list(names); win.destroy()
+            with self.prefetch_lock: self.prefetch_queue.clear(); self._start_initial_prefetch()
+        ttk.Button(btns, text="Add", command=on_add).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=(0,8))
+
+    def _open_remove_terms(self):
+        win = tk.Toplevel(self.root); win.title("Remove Terms"); win.transient(self.root); win.grab_set()
+        frm = ttk.Frame(win, padding=12); frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text="Select one or more terms to remove:").pack(anchor="w")
+        lb = tk.Listbox(frm, selectmode=tk.EXTENDED, width=40, height=20); lb.pack(fill=tk.BOTH, expand=True, pady=6)
+        sorted_terms = sorted(self.terms, key=lambda t: t.name.casefold())
+        for t in sorted_terms: lb.insert(tk.END, f"{t.name}  ({t.rating:.0f}, g={t.games})")
+        btns = ttk.Frame(frm); btns.pack(fill=tk.X, pady=(8,0))
+        def on_remove():
+            sel = lb.curselection()
+            if not sel: win.destroy(); return
+            to_remove = [sorted_terms[i] for i in sel]
+            names = [t.name for t in to_remove]
+            self.terms = [t for t in self.terms if t not in to_remove]
+            for nm in names:
+                try: del self.used[nm]
+                except Exception: pass
+            try:
+                self._save_terms_atomic()
+                self._save_used_atomic()
+            except Exception: pass
+            win.destroy()
+            with self.prefetch_lock: self.prefetch_queue.clear(); self._start_initial_prefetch()
+            self._update_progress()
+        ttk.Button(btns, text="Remove Selected", command=on_remove).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=(0,8))
+
     # ---------- Prefetch orchestration ----------
     def _start_initial_prefetch(self):
         def worker():
@@ -594,8 +553,12 @@ class App:
                 batch = self._prefetch_round()
                 max_q = int(cfg_get().get("prefetch_max_queue", 2))
                 with self.prefetch_lock:
-                    if len(self.prefetch_queue) >= max_q: break
-                    self.prefetch_queue.append(batch)
+                    if len(self.prefetch_queue) < max_q:
+                        self.prefetch_queue.append(batch)
+                # Also keep spares filled
+                self._fill_spares_async()
+                if len(self.prefetch_queue) >= max_q:
+                    break
         except Exception:
             pass
 
@@ -607,14 +570,75 @@ class App:
             return batch
         return self._prefetch_round()
 
-    # ---------- Candidate picking (NO UI in worker) ----------
+    # ---------- Spare prefetch for OTHER ----------
+    def _fill_spares_async(self):
+        cfg = cfg_get()
+        spare_target = int(cfg.get("spare_per_slot", 1))
+        other_hosts = [host_of(u) if u else None for u in self.current_urls]
+        exclude_names = {t.name for t in self.current_four} if self.current_four else set()
+
+        def fill_slot(idx: int):
+            while not self.shutting_down:
+                with self.spares_lock:
+                    if len(self.spares[idx]) >= spare_target:
+                        return
+                entry = self._prefetch_one_for_slot(idx, exclude_names, other_hosts, respect_hosts=True)
+                if entry is None:
+                    entry = self._prefetch_one_for_slot(idx, exclude_names, other_hosts, respect_hosts=False)
+                if entry:
+                    with self.spares_lock:
+                        self.spares[idx].append(entry)
+                else:
+                    return
+
+        for i in range(4):
+            threading.Thread(target=fill_slot, args=(i,), daemon=True).start()
+
+    def _prefetch_one_for_slot(self, idx: int, exclude_names: set[str], other_hosts: list[str | None], respect_hosts: bool) -> PrefetchEntry | None:
+        cfg = cfg_get()
+        alt_list = weighted_sample_terms(self.terms, 1, recency_map=self.recency_map, exclude=exclude_names)
+        new_term = alt_list[0] if alt_list else None
+        if not new_term: return None
+
+        use_used = cfg.get("use_used_url_cache", True)
+        avoid_dup = cfg.get("avoid_dup_hashes", True)
+        unique_hosts = cfg.get("unique_hosts_per_round", True)
+        candidates = ddg_candidates(new_term.name, self.extra_var.get())
+        if not candidates: return None
+
+        used_set = self.used.get(new_term.name, set()) if use_used else set()
+        round_hosts = set(h for j,h in enumerate(other_hosts) if (j!=idx and h))
+
+        for u in candidates:
+            if use_used and u in used_set: continue
+            if respect_hosts and unique_hosts:
+                hst = host_of(u)
+                if hst and hst in round_hosts: continue
+            d = download_image_bytes(u, u)
+            if not d: continue
+            if not looks_like_woman(d): continue
+            if cfg.get("face_required", True) and not _has_face_bytes(d): continue
+            hh = phash_bytes(d)
+            if avoid_dup and hh and hh in self.seen_hashes: continue
+            # Persist seen/used now (atomic)
+            if use_used:
+                if new_term.name not in self.used: self.used[new_term.name] = set()
+                self.used[new_term.name].add(u)
+                try: self._save_used_atomic()
+                except Exception: pass
+            if avoid_dup and hh:
+                self.seen_hashes.add(hh)
+                try: self._save_seen_hashes_atomic()
+                except Exception: pass
+            return PrefetchEntry(term=new_term, url=u, data=d)
+        return None
+
+    # ---------- Candidate picking (regular 4-up round) ----------
     def _prefetch_round(self) -> PrefetchBatch:
         cfg = cfg_get()
         if len(self.terms) < 4: return PrefetchBatch(entries=[])
 
-        # sample 4 with recency cooldown
         four = weighted_sample_terms(self.terms, 4, recency_map=self.recency_map)
-
         extra = self.extra_var.get()
         round_hosts: set[str] = set()
 
@@ -628,7 +652,6 @@ class App:
         avoid_dup = cfg.get("avoid_dup_hashes", True)
         unique_hosts = cfg.get("unique_hosts_per_round", True)
 
-        # primary pass
         for i, term in enumerate(four):
             candidates = ddg_candidates(term.name, extra)
             if candidates:
@@ -650,7 +673,6 @@ class App:
                     if avoid_dup and hh: self.seen_hashes.add(hh)
                     break
 
-        # fallback: swap in alternate terms for failed slots
         try:
             exclude = set(t.name for t in four)
             for i in range(4):
@@ -685,21 +707,18 @@ class App:
         except Exception:
             pass
 
-        # persist caches best-effort (atomic)
         try:
             if use_used: self._save_used_atomic()
             if avoid_dup: self._save_seen_hashes_atomic()
         except Exception:
             pass
 
-        # recency update
         cap = int(cfg.get("recency_cap_factor", 10)) * int(core.COOLDOWN_WINDOW or 1)
         for k in list(self.recency_map.keys()):
             self.recency_map[k] = min(self.recency_map[k] + 1, cap)
         for t in four: self.recency_map[t.name] = 0
         self.round_id += 1
 
-        # Build atomic entries
         entries = [PrefetchEntry(term=four[i], url=urls[i], data=datas[i]) for i in range(4)]
         return PrefetchBatch(entries=entries)
 
@@ -708,7 +727,6 @@ class App:
         if not batch.entries or len(batch.entries) != 4:
             messagebox.showerror("Need more terms","At least 4 terms are required."); return
 
-        # Atomically replace current state from the entries list
         self.current_four = [e.term for e in batch.entries]
         self.current_urls = [e.url for e in batch.entries]
         self.current_raw_bytes = [e.data for e in batch.entries]
@@ -738,6 +756,7 @@ class App:
                 canvas_show_error(lbl, "No image"); draw_title(lbl, term.name)
 
         self._update_progress()
+        threading.Thread(target=self._fill_spares_async, daemon=True).start()
 
     # ---------- Progress ----------
     def _calc_progress(self) -> tuple[float, float]:
@@ -775,17 +794,39 @@ class App:
     def _on_click(self, idx: int):
         if not self.current_four or idx >= len(self.current_four): return
         winner = self.current_four[idx]; losers = [t for i, t in enumerate(self.current_four) if i != idx]
-        # Save winning image (best-effort)
         self._save_winning_image_uncropped(idx, winner)
-        # Update ratings
         elo_update(winner, losers)
         try: self._save_terms_atomic()
         except Exception: pass
-        # Fetch and show a fresh, coherent batch
+        self._update_progress()
         batch = self._consume_prefetch_or_fetch()
         self._display_batch(batch)
 
     def _on_other(self, idx: int):
+        with self.spares_lock:
+            spare = self.spares[idx].pop(0) if self.spares[idx] else None
+        if spare:
+            self.current_four[idx] = spare.term
+            self.current_urls[idx] = spare.url
+            self.current_raw_bytes[idx] = spare.data
+            lbl = self.labels[idx]
+            draw_title(lbl, spare.term.name)
+            if DEBUG_OVERLAY:
+                draw_debug(lbl, host_of(spare.url) if spare.url else "-")
+            if spare.data:
+                try:
+                    pil = Image.open(io.BytesIO(spare.data)).convert("RGB")
+                    self.current_pils[idx] = pil
+                    render_to_canvas(lbl, pil)
+                    draw_title(lbl, spare.term.name)
+                    if DEBUG_OVERLAY:
+                        draw_debug(lbl, host_of(spare.url) if spare.url else "-")
+                except Exception:
+                    self.current_pils[idx] = None
+            threading.Thread(target=self._fill_spares_async, daemon=True).start()
+            return
+
+        # Fallback (rare) if no spare yet
         if not self.current_four or idx >= len(self.current_four): return
         old_term = self.current_four[idx]; extra = self.extra_var.get()
         def worker():
@@ -883,7 +924,7 @@ def main():
     root = tk.Tk(); root.geometry("1300x1000"); root.minsize(900, 700)
     App(root, arg_path); root.mainloop()
 
-# -------------------- Gallery (unchanged core behavior) --------------------
+# -------------------- Gallery --------------------
 class GalleryWindow(tk.Toplevel):
     BATCH_SIZE = SETTINGS_DEFAULTS["gallery_batch_size"]
     VIS_BUFFER = SETTINGS_DEFAULTS["gallery_vis_buffer"]
