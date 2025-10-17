@@ -143,7 +143,6 @@ class App:
     def __init__(self, root: tk.Tk, terms_path: str | None):
         self.root = root
         cfg = cfg_get()
-        # apply immediate settings
         core.COOLDOWN_WINDOW = int(cfg.get("cooldown_window", 10))
         images.ENFORCE_WOMAN = bool(cfg.get("enforce_woman", True))
         images.MIN_DIM = int(cfg.get("min_dim", 256))
@@ -202,7 +201,8 @@ class App:
         for text, cmd in [("Gallery", self._open_gallery), ("Settings…", self._open_settings),
                           ("Open Terms File", self._open_file), ("Remove Terms…", self._open_remove_terms),
                           ("Add Terms…", self._open_add_terms),
-                          ("Progress 3D…", self._open_progress3d)]:
+                          ("Progress 3D…", self._open_progress3d),
+                          ("DeDupe", self._run_dedupe)]:
             ttk.Button(rightbar, text=text, command=cmd).pack(side=tk.LEFT, padx=(0,6))
 
         ttk.Label(rightbar, text="  ").pack(side=tk.LEFT)
@@ -256,6 +256,39 @@ class App:
                 return
             show_progress_3d(self.terms)
         threading.Thread(target=runner, daemon=True).start()
+
+    def _run_dedupe(self):
+        try:
+            from .dedupe import dedupe_ranked_images, THRESHOLD
+        except Exception as e:
+            messagebox.showerror("DeDupe", f"Couldn't import dedupe tool.\n\nDetails: {e}")
+            return
+        if not self.terms_path:
+            messagebox.showwarning("DeDupe", "No terms file loaded.")
+            return
+        confirm = messagebox.askyesno(
+            "DeDupe",
+            f"This will permanently delete visually redundant images\n"
+            f"(threshold = {THRESHOLD}).\n\nProceed?"
+        )
+        if not confirm:
+            return
+        def worker():
+            try:
+                base_dir = Path(self.terms_path).expanduser().resolve().parent
+                summary = dedupe_ranked_images(base_dir)
+                t = summary.get("totals", {})
+                msg_lines = [
+                    "Deduplication completed.",
+                    f"Threshold: {THRESHOLD}",
+                    f"Scanned:   {t.get('scanned', 0)}",
+                    f"Kept:      {t.get('kept', 0)}",
+                    f"Deleted:   {t.get('deleted', 0)}",
+                ]
+                self.root.after(0, lambda: messagebox.showinfo("DeDupe", "\\n".join(msg_lines)))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("DeDupe failed", str(e)))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _existing_norm_names(self) -> set[str]:
         from .persistence import normalize_term
@@ -378,12 +411,10 @@ class App:
             add_group.r += 1
             return var
 
-        # A. Selection
         add_group("A. Selection")
         v_cooldown = add_int("Cooldown window (1) [0..999]", "cooldown_window", (0, 999), "Lower = can reappear sooner")
         v_recency_cap = add_int("Recency cap factor (2) [1..100]", "recency_cap_factor", (1, 100), "Cap = factor × cooldown")
 
-        # B. Image filtering
         add_group("B. Image filtering")
         v_enf_woman = add_bool("Require “woman” filter (4)", "enforce_woman")
         v_face_req = add_bool("Require face detection (5)", "face_required")
@@ -392,13 +423,11 @@ class App:
         v_face_scale = add_float("Face scale factor (8) [1.05..1.5]", "face_scale_factor", (1.05, 1.5), 0.01, "Lower = slower but more sensitive")
         v_min_dim = add_int("Minimum image dimension px (9) [0..2000]", "min_dim", (0, 2000))
 
-        # C. Search & networking
         add_group("C. Search & networking")
         v_ddg_max = add_int("DuckDuckGo max results (10) [10..200]", "ddg_max_results", (10, 200))
         v_topk = add_int("Candidate top-K (11) [1..50]", "top_sample_k", (1, 50))
         v_timeout = add_int("HTTP timeout seconds (12) [1..60]", "timeout", (1, 60))
 
-        # D. Prefetch & caching
         add_group("D. Prefetch & caching")
         v_unique_host = add_bool("Enforce unique host per round (13)", "unique_hosts_per_round", "Avoid all 4 from same site")
         v_avoid_dup = add_bool("Avoid duplicate images (pHash) (14)", "avoid_dup_hashes", "Skip near-duplicates globally")
@@ -406,7 +435,6 @@ class App:
         v_use_used = add_bool("Use per-term used-URL cache (16)", "use_used_url_cache", "Remember URLs shown for a term")
         v_use_seen = add_bool("Use global seen-hash cache (17)", "use_seen_hash_cache", "Avoid dupes across sessions")
 
-        # E. Gallery
         add_group("E. Gallery (All ranked images)")
         v_g_batch = add_int("Thumbs 'load more' batch size (24) [4..40]", "gallery_batch_size", (4, 40), "* requires restart of Gallery window")
         v_g_vis = add_int("Scroll prefetch buffer px (25) [200..4000]", "gallery_vis_buffer", (200, 4000), "* requires restart of Gallery window")
@@ -497,7 +525,6 @@ class App:
         avoid_dup = cfg.get("avoid_dup_hashes", True)
         unique_hosts = cfg.get("unique_hosts_per_round", True)
 
-        # primary pass
         for i, term in enumerate(four):
             candidates = ddg_candidates(term.name, extra)
             if candidates:
@@ -519,7 +546,6 @@ class App:
                     if avoid_dup and hh: self.seen_hashes.add(hh)
                     break
 
-        # fallback: alternate terms
         try:
             exclude = set(t.name for t in four)
             for i in range(4):
@@ -849,7 +875,8 @@ class GalleryWindow(tk.Toplevel):
         try:
             top = int(self.canvas.canvasy(0)); bottom = int(self.canvas.canvasy(self.canvas.winfo_height()))
         except Exception: return
-        top -= int(cfg_get().get("gallery_vis_buffer", 800)); bottom += int(cfg_get().get("gallery_vis_buffer", 800))
+        buf = int(cfg_get().get("gallery_vis_buffer", 800))
+        top -= buf; bottom += buf
         for row_frame, meta in self._row_widgets:
             try:
                 ry0 = row_frame.winfo_y(); ry1 = ry0 + row_frame.winfo_height()
